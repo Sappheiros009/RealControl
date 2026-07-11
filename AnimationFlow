@@ -1,0 +1,367 @@
+using HarmonyLib;
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace Sapphire009.RealControlMod
+{
+    /*
+     * RealControlPlugin의 harmony.PatchAll()에 의해 함께 적용됩니다.
+     *
+     * 별도의 BepInPlugin을 선언하지 않으므로
+     * RealControl.dll 하나 안에서 동작합니다.
+     */
+    internal static class AnimationFlow
+    {
+        private const float ActiveMovementSqrMagnitude = 0.0025f;
+        private const float MinimumDirectionSqrMagnitude = 0.01f;
+        private const float MinimumAnimationSpeed = 0.01f;
+
+        private static readonly int ClimbJumpAnimationHash =
+            Animator.StringToHash("Climb Jump");
+
+        private static readonly int InputXAnimationHash =
+            Animator.StringToHash("Input X");
+
+        private static readonly int InputYAnimationHash =
+            Animator.StringToHash("Input Y");
+
+        private static readonly Dictionary<int, AnimationFlowState> FlowStates =
+            new Dictionary<int, AnimationFlowState>();
+
+        private sealed class AnimationFlowState
+        {
+            public bool HasDirectionalPose;
+
+            public bool IsFrozen;
+
+            public Vector2 LastDirection =
+                Vector2.zero;
+        }
+
+        private static Character ResolveCharacter(
+            Component component)
+        {
+            if (component == null)
+            {
+                return null;
+            }
+
+            Character character =
+                component.GetComponent<Character>();
+
+            if (character == null)
+            {
+                character =
+                    component.GetComponentInParent<Character>();
+            }
+
+            return character;
+        }
+
+        private static AnimationFlowState GetOrCreateState(
+            Character character)
+        {
+            int characterId =
+                character.GetInstanceID();
+
+            AnimationFlowState state;
+
+            if (!FlowStates.TryGetValue(
+                    characterId,
+                    out state))
+            {
+                state =
+                    new AnimationFlowState();
+
+                FlowStates.Add(
+                    characterId,
+                    state);
+            }
+
+            return state;
+        }
+
+        private static bool IsLocalNormalWallClimbing(
+            Character character)
+        {
+            if (character == null ||
+                !character.IsLocal ||
+                character.data == null ||
+                character.refs == null ||
+                character.refs.climbing == null ||
+                character.refs.animator == null)
+            {
+                return false;
+            }
+
+            return
+                character.data.isClimbing &&
+                !character.data.isRopeClimbing &&
+                !character.data.isVineClimbing &&
+                character.data.currentClimbHandle == null;
+        }
+
+        private static float GetClimbAnimationSpeed(
+            Character character)
+        {
+            if (character == null ||
+                character.data == null)
+            {
+                return 1f;
+            }
+
+            return Mathf.Max(
+                MinimumAnimationSpeed,
+                character.data.staminaMod);
+        }
+
+        private static void RestoreAndRemoveState(
+            Character character)
+        {
+            if (character == null)
+            {
+                return;
+            }
+
+            int characterId =
+                character.GetInstanceID();
+
+            AnimationFlowState state;
+
+            /*
+             * AnimationFlow가 실제로 관리하던 캐릭터만 복구합니다.
+             * 일반 상태의 Animator.speed를 매 프레임 1로 덮어쓰지 않습니다.
+             */
+            if (!FlowStates.TryGetValue(
+                    characterId,
+                    out state))
+            {
+                return;
+            }
+
+            if (state.IsFrozen &&
+                character.refs != null &&
+                character.refs.animator != null)
+            {
+                /*
+                 * 벽에서 떨어진 뒤에도 Animator.speed가 0으로
+                 * 남아 캐릭터 전체 애니메이션이 멈추지 않게 복구합니다.
+                 */
+                character.refs.animator.speed =
+                    1f;
+            }
+
+            FlowStates.Remove(
+                characterId);
+        }
+
+        /*
+         * CharacterAnimations.Update가 일반 벽잡기 자세로
+         * Input X/Y를 0으로 되돌린 뒤 가장 마지막에 실행됩니다.
+         *
+         * 움직이는 동안에는 애니메이션을 정상 재생하고,
+         * 움직임이 끝나면 마지막 방향과 현재 프레임을 그대로 멈춥니다.
+         */
+        [HarmonyPatch(
+            typeof(CharacterAnimations),
+            "Update")]
+        private static class CharacterAnimationsFlowPatch
+        {
+            [HarmonyPostfix]
+
+            /*
+             * RealControl.cs의 Priority.Last 패치보다도
+             * 나중에 실행되도록 더 낮은 우선순위를 사용합니다.
+             */
+            [HarmonyPriority(-100)]
+            private static void Postfix(
+                CharacterAnimations __instance)
+            {
+                Character character =
+                    ResolveCharacter(__instance);
+
+                if (character == null ||
+                    !character.IsLocal)
+                {
+                    return;
+                }
+
+                if (!IsLocalNormalWallClimbing(
+                        character))
+                {
+                    RestoreAndRemoveState(
+                        character);
+
+                    return;
+                }
+
+                Animator animator =
+                    character.refs.animator;
+
+                CharacterClimbing climbing =
+                    character.refs.climbing;
+
+                AnimationFlowState state =
+                    GetOrCreateState(
+                        character);
+
+                /*
+                 * Shift 전용 Climb Jump 애니메이션은 사용하지 않습니다.
+                 */
+                animator.SetBool(
+                    ClimbJumpAnimationHash,
+                    false);
+
+                bool isMoving =
+                    climbing.playerSlide.sqrMagnitude >
+                    ActiveMovementSqrMagnitude;
+
+                if (isMoving)
+                {
+                    Vector2 currentDirection =
+                        new Vector2(
+                            animator.GetFloat(
+                                InputXAnimationHash),
+                            animator.GetFloat(
+                                InputYAnimationHash));
+
+                    /*
+                     * RealControl이 넣은 W/A/S/D 방향을 저장합니다.
+                     */
+                    if (currentDirection.sqrMagnitude >
+                        MinimumDirectionSqrMagnitude)
+                    {
+                        state.LastDirection =
+                            currentDirection;
+
+                        state.HasDirectionalPose =
+                            true;
+                    }
+                    else if (state.HasDirectionalPose)
+                    {
+                        animator.SetFloat(
+                            InputXAnimationHash,
+                            state.LastDirection.x);
+
+                        animator.SetFloat(
+                            InputYAnimationHash,
+                            state.LastDirection.y);
+                    }
+
+                    /*
+                     * 이전 입력에서 멈춰 있던 현재 프레임부터
+                     * 애니메이션 재생을 그대로 이어갑니다.
+                     */
+                    animator.speed =
+                        GetClimbAnimationSpeed(
+                            character);
+
+                    state.IsFrozen =
+                        false;
+
+                    return;
+                }
+
+                /*
+                 * 아직 한 번도 방향 이동을 하지 않았다면
+                 * 최초 벽잡기 기본 자세는 원본대로 유지합니다.
+                 */
+                if (!state.HasDirectionalPose)
+                {
+                    return;
+                }
+
+                /*
+                 * W를 놓아도 Input Y를 0으로 되돌리지 않고
+                 * 마지막 W 방향값을 계속 유지합니다.
+                 *
+                 * A/S/D도 동일하게 마지막 방향을 유지합니다.
+                 */
+                animator.SetFloat(
+                    InputXAnimationHash,
+                    state.LastDirection.x);
+
+                animator.SetFloat(
+                    InputYAnimationHash,
+                    state.LastDirection.y);
+
+                /*
+                 * 현재 재생 중이던 정확한 프레임에서 멈춥니다.
+                 *
+                 * 다음 좌우클릭 이동이 시작되면 animator.speed가
+                 * 다시 복구되므로 멈춘 프레임부터 이어서 재생됩니다.
+                 */
+                animator.speed =
+                    0f;
+
+                state.IsFrozen =
+                    true;
+            }
+        }
+
+        /*
+         * 새로운 벽을 잡을 때는 이전 벽에서 저장된
+         * 애니메이션 방향과 정지 프레임을 초기화합니다.
+         */
+        [HarmonyPatch(
+            typeof(CharacterClimbing),
+            "StartClimbRpc",
+            new Type[]
+            {
+                typeof(Vector3),
+                typeof(Vector3)
+            })]
+        private static class StartClimbAnimationFlowPatch
+        {
+            [HarmonyPostfix]
+            [HarmonyPriority(-100)]
+            private static void Postfix(
+                CharacterClimbing __instance)
+            {
+                Character character =
+                    ResolveCharacter(__instance);
+
+                if (character == null ||
+                    !character.IsLocal)
+                {
+                    return;
+                }
+
+                RestoreAndRemoveState(
+                    character);
+            }
+        }
+
+        /*
+         * 벽을 놓거나 추락할 때 Animator.speed를 1로 복구합니다.
+         */
+        [HarmonyPatch(
+            typeof(CharacterClimbing),
+            nameof(CharacterClimbing.StopClimbingRpc),
+            new Type[]
+            {
+                typeof(float)
+            })]
+        private static class StopClimbAnimationFlowPatch
+        {
+            [HarmonyPostfix]
+            [HarmonyPriority(-100)]
+            private static void Postfix(
+                CharacterClimbing __instance)
+            {
+                Character character =
+                    ResolveCharacter(__instance);
+
+                if (character == null ||
+                    !character.IsLocal)
+                {
+                    return;
+                }
+
+                RestoreAndRemoveState(
+                    character);
+            }
+        }
+    }
+}
