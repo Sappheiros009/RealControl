@@ -1,0 +1,143 @@
+using HarmonyLib;
+using System;
+using UnityEngine;
+
+namespace Sapphire009.RealControlMod
+{
+    internal static class NoDelay
+    {
+        private const float ShortClimbDelay = 0.5f;
+        private const float ReadyClimbJumpTime = 2f;
+
+        private static Character ResolveCharacter(
+            Component component)
+        {
+            if (component == null)
+            {
+                return null;
+            }
+
+            Character character =
+                component.GetComponent<Character>();
+
+            if (character == null)
+            {
+                character =
+                    component.GetComponentInParent<Character>();
+            }
+
+            return character;
+        }
+
+        private static bool IsLocalNormalWallClimbing(
+            Character character)
+        {
+            if (character == null ||
+                !character.IsLocal ||
+                character.data == null)
+            {
+                return false;
+            }
+
+            return
+                character.data.isClimbing &&
+                !character.data.isRopeClimbing &&
+                !character.data.isVineClimbing &&
+                character.data.currentClimbHandle == null;
+        }
+
+        private static void UpdateShortDelay(
+            Character character)
+        {
+            if (!IsLocalNormalWallClimbing(
+                    character))
+            {
+                return;
+            }
+
+            if (character.data.sinceClimbJump >=
+                    ShortClimbDelay &&
+                character.data.sinceClimbJump <
+                    ReadyClimbJumpTime)
+            {
+                character.data.sinceClimbJump =
+                    ReadyClimbJumpTime;
+            }
+        }
+
+        [HarmonyPatch(
+            typeof(CharacterInput),
+            "Sample",
+            new Type[]
+            {
+                typeof(bool)
+            })]
+        private static class CharacterInputSampleShortDelayPatch
+        {
+            [HarmonyPrefix]
+            [HarmonyPriority(Priority.First)]
+            private static void Prefix(
+                CharacterInput __instance)
+            {
+                Character character =
+                    ResolveCharacter(__instance);
+
+                UpdateShortDelay(
+                    character);
+            }
+        }
+
+        [HarmonyPatch(
+            typeof(CharacterClimbing),
+            nameof(CharacterClimbing.RPCA_ClimbJump))]
+        private static class ClimbJumpShortDelayPatch
+        {
+            [HarmonyPostfix]
+            [HarmonyPriority(Priority.Last)]
+            private static void Postfix(
+                CharacterClimbing __instance)
+            {
+                Character character =
+                    ResolveCharacter(__instance);
+
+                if (!IsLocalNormalWallClimbing(
+                        character))
+                {
+                    return;
+                }
+
+                character.data.sinceClimbJump =
+                    0f;
+            }
+        }
+
+        [HarmonyPatch(
+            typeof(CharacterClimbing),
+            "StartClimbRpc",
+            new Type[]
+            {
+                typeof(Vector3),
+                typeof(Vector3)
+            })]
+        private static class StartClimbShortDelayPatch
+        {
+            [HarmonyPostfix]
+            [HarmonyPriority(Priority.Last)]
+            private static void Postfix(
+                CharacterClimbing __instance)
+            {
+                Character character =
+                    ResolveCharacter(__instance);
+
+                if (!IsLocalNormalWallClimbing(
+                        character))
+                {
+                    return;
+                }
+
+                character.data.sinceClimbJump =
+                    0f;
+            }
+        }
+    }
+}
