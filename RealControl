@@ -1,0 +1,419 @@
+using BepInEx;
+using BepInEx.Configuration;
+using BepInEx.Logging;
+using HarmonyLib;
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+
+[BepInPlugin(PluginGUID, PluginName, PluginVersion)]
+public sealed class RealControl : BaseUnityPlugin
+{
+    public const string PluginGUID = "Sapphire009.RealControl";
+    public const string PluginName = "RealControl";
+    public const string PluginVersion = "1.0.0";
+
+    private const string BuildMarker = "DiscreteWallClimb-R1";
+    private const float NormalGrabDetectionWindow = 0.75f;
+    private const float MinimumDirectionSqrMagnitude = 0.0001f;
+
+    internal static ManualLogSource ModLogger;
+
+    private static ConfigEntry<float> upStepDistance;
+    private static ConfigEntry<float> sideStepDistance;
+    private static ConfigEntry<float> downStepDistance;
+    private static ConfigEntry<bool> logSuccessfulSteps;
+
+    private static readonly Dictionary<int, InputState> InputStates =
+        new Dictionary<int, InputState>();
+
+    private Harmony harmony;
+
+    private enum ExpectedHand
+    {
+        Left,
+        Right
+    }
+
+    private enum StepDirection
+    {
+        Up,
+        Down,
+        Left,
+        Right
+    }
+
+    private sealed class InputState
+    {
+        public bool WasControlledWallClimbing;
+        public bool LeftKeyHeld;
+        public bool RightKeyHeld;
+        public bool DownKeyHeld;
+        public float LastPrimaryPressedTime = float.NegativeInfinity;
+        public ExpectedHand NextHand = ExpectedHand.Left;
+    }
+
+    private void Awake()
+    {
+        ModLogger = Logger;
+
+        upStepDistance = Config.Bind(
+            "Climb Step",
+            "UpStepDistance",
+            0.45f,
+            "좌클릭/우클릭 교대 입력 1회당 위로 이동할 거리입니다.");
+
+        sideStepDistance = Config.Bind(
+            "Climb Step",
+            "SideStepDistance",
+            0.45f,
+            "A 또는 D 입력 1회당 좌우로 이동할 거리입니다.");
+
+        downStepDistance = Config.Bind(
+            "Climb Step",
+            "DownStepDistance",
+            0.45f,
+            "S 입력 1회당 아래로 이동할 거리입니다.");
+
+        logSuccessfulSteps = Config.Bind(
+            "Debug",
+            "LogSuccessfulSteps",
+            false,
+            "true이면 적용된 등반 스텝을 로그에 기록합니다.");
+
+        harmony = new Harmony(PluginGUID);
+        harmony.PatchAll();
+
+        Logger.LogInfo(
+            $"{PluginName} {PluginVersion} loaded. " +
+            $"Developer=Sapphire009. Build={BuildMarker}.");
+    }
+
+    private void OnDestroy()
+    {
+        InputStates.Clear();
+
+        if (harmony != null)
+        {
+            harmony.UnpatchSelf();
+            harmony = null;
+        }
+
+        ModLogger = null;
+    }
+
+    private static InputState GetOrCreateState(CharacterInput characterInput)
+    {
+        int inputId = characterInput.GetInstanceID();
+        InputState state;
+
+        if (!InputStates.TryGetValue(inputId, out state))
+        {
+            state = new InputState();
+            InputStates.Add(inputId, state);
+        }
+
+        return state;
+    }
+
+    private static bool IsControlledWallClimbing(Character character)
+    {
+        if (character == null ||
+            character.data == null ||
+            character.refs == null ||
+            character.refs.climbing == null)
+        {
+            return false;
+        }
+
+        return character.data.isClimbing &&
+               !character.data.isRopeClimbing &&
+               !character.data.isVineClimbing &&
+               character.data.currentClimbHandle == null;
+    }
+
+    private static bool ReadLeftHeld(Vector2 sampledMovement)
+    {
+        if (CharacterInput.action_moveLeft != null)
+        {
+            return CharacterInput.action_moveLeft.IsPressed();
+        }
+
+        return sampledMovement.x < -0.5f;
+    }
+
+    private static bool ReadRightHeld(Vector2 sampledMovement)
+    {
+        if (CharacterInput.action_moveRight != null)
+        {
+            return CharacterInput.action_moveRight.IsPressed();
+        }
+
+        return sampledMovement.x > 0.5f;
+    }
+
+    private static bool ReadDownHeld(Vector2 sampledMovement)
+    {
+        if (CharacterInput.action_moveBackward != null)
+        {
+            return CharacterInput.action_moveBackward.IsPressed();
+        }
+
+        return sampledMovement.y < -0.5f;
+    }
+
+    private static void UpdateHeldStates(
+        InputState state,
+        bool leftHeld,
+        bool rightHeld,
+        bool downHeld)
+    {
+        state.LeftKeyHeld = leftHeld;
+        state.RightKeyHeld = rightHeld;
+        state.DownKeyHeld = downHeld;
+    }
+
+    private static void BeginControlledClimb(
+        Character character,
+        InputState state,
+        bool leftHeld,
+        bool rightHeld,
+        bool downHeld)
+    {
+        bool startedByNormalLeftClick =
+            Time.unscaledTime - state.LastPrimaryPressedTime <=
+            NormalGrabDetectionWindow;
+
+        // 일반 벽잡기의 좌클릭을 첫 손동작으로 계산한다.
+        // 따라서 정상적으로 좌클릭해서 벽을 잡았다면 첫 상승 입력은 우클릭이다.
+        // 점프 자동 벽잡기처럼 좌클릭 없이 잡았다면 첫 상승 입력은 좌클릭이다.
+        state.NextHand = startedByNormalLeftClick
+            ? ExpectedHand.Right
+            : ExpectedHand.Left;
+
+        UpdateHeldStates(state, leftHeld, rightHeld, downHeld);
+
+        character.refs.climbing.playerSlide = Vector2.zero;
+        state.WasControlledWallClimbing = true;
+    }
+
+    private static bool TryApplyStep(
+        Character character,
+        StepDirection stepDirection)
+    {
+        if (!IsControlledWallClimbing(character))
+        {
+            return false;
+        }
+
+        Vector3 wallNormal = character.data.climbNormal;
+
+        if (wallNormal.sqrMagnitude < MinimumDirectionSqrMagnitude)
+        {
+            return false;
+        }
+
+        wallNormal.Normalize();
+
+        Vector3 wallUp = Vector3.ProjectOnPlane(Vector3.up, wallNormal);
+
+        if (wallUp.sqrMagnitude < MinimumDirectionSqrMagnitude)
+        {
+            return false;
+        }
+
+        wallUp.Normalize();
+
+        Vector3 wallRight = Vector3.Cross(wallNormal, wallUp);
+
+        if (wallRight.sqrMagnitude < MinimumDirectionSqrMagnitude)
+        {
+            return false;
+        }
+
+        wallRight.Normalize();
+
+        Vector3 stepVector = Vector3.zero;
+
+        switch (stepDirection)
+        {
+            case StepDirection.Up:
+                stepVector = wallUp * Mathf.Max(0.01f, upStepDistance.Value);
+                break;
+
+            case StepDirection.Down:
+                stepVector = -wallUp * Mathf.Max(0.01f, downStepDistance.Value);
+                break;
+
+            case StepDirection.Left:
+                stepVector = -wallRight * Mathf.Max(0.01f, sideStepDistance.Value);
+                break;
+
+            case StepDirection.Right:
+                stepVector = wallRight * Mathf.Max(0.01f, sideStepDistance.Value);
+                break;
+        }
+
+        if (stepVector.sqrMagnitude < MinimumDirectionSqrMagnitude)
+        {
+            return false;
+        }
+
+        // PEAK 원본 등반은 climbPos를 목표점으로 사용한다.
+        // 목표점만 1회 이동시키고 movementInput을 0으로 유지하면
+        // 지정 거리만 움직인 뒤 새 목표점에서 자동으로 멈춘다.
+        character.refs.climbing.playerSlide = Vector2.zero;
+        character.data.climbPos += stepVector;
+        character.data.sinceGrounded = 0f;
+
+        if (logSuccessfulSteps.Value)
+        {
+            ModLogger?.LogInfo(
+                $"[RealControl] Step={stepDirection}, " +
+                $"Distance={stepVector.magnitude:0.000}, " +
+                $"ClimbPos={character.data.climbPos}");
+        }
+
+        return true;
+    }
+
+    private static void ProcessControlledClimbInput(
+        CharacterInput characterInput,
+        Character character,
+        InputState state,
+        bool leftPressed,
+        bool rightPressed,
+        bool downPressed)
+    {
+        bool primaryPressed = characterInput.usePrimaryWasPressed;
+        bool secondaryPressed = characterInput.useSecondaryWasPressed;
+
+        // W/A/S/D를 꾹 눌러도 원본 연속 이동이 발생하지 않게 한다.
+        characterInput.movementInput = Vector2.zero;
+
+        // 원본은 좌클릭 해제 시 벽을 놓지만,
+        // 이 모드는 좌/우 클릭 교대가 필요하므로 해제를 무시한다.
+        // 벽을 놓으려면 원본과 동일하게 스페이스바를 사용한다.
+        characterInput.usePrimaryWasReleased = false;
+
+        if (primaryPressed)
+        {
+            if (state.NextHand == ExpectedHand.Left &&
+                TryApplyStep(character, StepDirection.Up))
+            {
+                state.NextHand = ExpectedHand.Right;
+            }
+        }
+        else if (secondaryPressed)
+        {
+            if (state.NextHand == ExpectedHand.Right &&
+                TryApplyStep(character, StepDirection.Up))
+            {
+                state.NextHand = ExpectedHand.Left;
+            }
+        }
+        else if (leftPressed)
+        {
+            TryApplyStep(character, StepDirection.Left);
+        }
+        else if (rightPressed)
+        {
+            TryApplyStep(character, StepDirection.Right);
+        }
+        else if (downPressed)
+        {
+            TryApplyStep(character, StepDirection.Down);
+        }
+
+        // 등반 중 마우스 입력은 RealControl이 소비한다.
+        characterInput.usePrimaryWasPressed = false;
+        characterInput.usePrimaryIsPressed = false;
+        characterInput.useSecondaryWasPressed = false;
+        characterInput.useSecondaryIsPressed = false;
+        characterInput.useSecondaryWasReleased = false;
+    }
+
+    [HarmonyPatch(
+        typeof(CharacterInput),
+        "Sample",
+        new Type[]
+        {
+            typeof(bool)
+        })]
+    private static class CharacterInputSamplePatch
+    {
+        [HarmonyPostfix]
+        [HarmonyPriority(Priority.Last)]
+        [HarmonyAfter(
+            new string[]
+            {
+                "Sapphire009.WASDX",
+                "Sapphire009.JumpingPEAK"
+            })]
+        private static void Postfix(CharacterInput __instance)
+        {
+            if (__instance == null)
+            {
+                return;
+            }
+
+            Character character = __instance.GetComponent<Character>();
+
+            if (character == null || !character.IsLocal)
+            {
+                return;
+            }
+
+            InputState state = GetOrCreateState(__instance);
+            Vector2 sampledMovement = __instance.movementInput;
+
+            bool leftHeld = ReadLeftHeld(sampledMovement);
+            bool rightHeld = ReadRightHeld(sampledMovement);
+            bool downHeld = ReadDownHeld(sampledMovement);
+
+            bool leftPressed = leftHeld && !state.LeftKeyHeld;
+            bool rightPressed = rightHeld && !state.RightKeyHeld;
+            bool downPressed = downHeld && !state.DownKeyHeld;
+
+            bool controlledWallClimbing =
+                IsControlledWallClimbing(character);
+
+            if (!controlledWallClimbing)
+            {
+                if (__instance.usePrimaryWasPressed)
+                {
+                    state.LastPrimaryPressedTime = Time.unscaledTime;
+                }
+
+                state.WasControlledWallClimbing = false;
+                UpdateHeldStates(state, leftHeld, rightHeld, downHeld);
+                return;
+            }
+
+            if (!state.WasControlledWallClimbing)
+            {
+                BeginControlledClimb(
+                    character,
+                    state,
+                    leftHeld,
+                    rightHeld,
+                    downHeld);
+
+                // 벽을 잡기 전부터 누르고 있던 키는 스텝으로 계산하지 않는다.
+                leftPressed = false;
+                rightPressed = false;
+                downPressed = false;
+            }
+
+            ProcessControlledClimbInput(
+                __instance,
+                character,
+                state,
+                leftPressed,
+                rightPressed,
+                downPressed);
+
+            UpdateHeldStates(state, leftHeld, rightHeld, downHeld);
+        }
+    }
+}
