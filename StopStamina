@@ -1,0 +1,100 @@
+using HarmonyLib;
+using System;
+
+namespace Sapphire009.RealControlMod
+{
+    /*
+     * RealControlPlugin의 harmony.PatchAll()에 의해 함께 적용됩니다.
+     *
+     * 별도의 BepInPlugin을 선언하지 않으므로
+     * RealControl.dll 하나 안에서 동작합니다.
+     */
+    internal static class StopStamina
+    {
+        /*
+         * PEAK 원본의 벽 매달리기 지속 소모는
+         * CharacterClimbing.Update에서 매 프레임
+         * UseStamina(num * Time.deltaTime, true)로 호출됩니다.
+         *
+         * RealControl의 클릭 대시는 0.1f를 순간 소모하므로,
+         * 0.1f보다 작은 등반 중 소모만 차단합니다.
+         */
+        private const float DashStaminaCost = 0.1f;
+        private const float ComparisonEpsilon = 0.001f;
+
+        private static bool IsNormalWallClimbing(
+            Character character)
+        {
+            if (character == null ||
+                !character.IsLocal ||
+                character.data == null)
+            {
+                return false;
+            }
+
+            return
+                character.data.isClimbing &&
+                !character.data.isRopeClimbing &&
+                !character.data.isVineClimbing &&
+                character.data.currentClimbHandle == null;
+        }
+
+        [HarmonyPatch(
+            typeof(Character),
+            "UseStamina",
+            new Type[]
+            {
+                typeof(float),
+                typeof(bool)
+            })]
+        private static class CharacterUseStaminaPatch
+        {
+            [HarmonyPrefix]
+            [HarmonyPriority(Priority.First)]
+            private static bool Prefix(
+                Character __instance,
+                float __0,
+                ref bool __result)
+            {
+                float requestedUsage =
+                    __0;
+
+                if (!IsNormalWallClimbing(
+                        __instance))
+                {
+                    return true;
+                }
+
+                if (requestedUsage <= 0f)
+                {
+                    return true;
+                }
+
+                /*
+                 * 0.1f 클릭 대시 소모는 그대로 통과시킵니다.
+                 *
+                 * 그보다 작은 매 프레임 벽 매달리기 소모만
+                 * 성공 처리하고 실제 기력은 차감하지 않습니다.
+                 */
+                if (requestedUsage >=
+                    DashStaminaCost -
+                    ComparisonEpsilon)
+                {
+                    return true;
+                }
+
+                /*
+                 * 원본처럼 스태미나를 사용 중인 상태는 유지합니다.
+                 * 따라서 벽에 매달린 동안 기력이 자동 회복되지는 않습니다.
+                 */
+                __instance.data.sinceUseStamina =
+                    0f;
+
+                __result =
+                    true;
+
+                return false;
+            }
+        }
+    }
+}
