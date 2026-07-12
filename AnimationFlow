@@ -12,32 +12,49 @@ namespace Sapphire009.RealControlMod
      * RealControl.dll 하나 안에서 동작합니다.
      *
      * 동작 목표:
-     * 1. RealControl이 climbPos를 변경하면 PEAK 원본 WASD 등반 애니메이션을 재생합니다.
-     * 2. 캐릭터가 해당 목표점으로 이동하는 동안 애니메이션을 계속 재생합니다.
-     * 3. 이동이 끝나면 현재 애니메이션 프레임에서 정지합니다.
+     * 1. RealControl이 실제 스텝 이동에 성공한 순간 이동 방향을 기록합니다.
+     * 2. 캐릭터가 해당 방향으로 실제 이동하는 동안만 애니메이션을 재생합니다.
+     * 3. 로컬 플레이어의 실제 이동이 끝나면 Animator.speed를 0으로 만듭니다.
      * 4. 다음 스텝이 시작되면 멈췄던 프레임부터 이어서 재생합니다.
+     *
+     * S 하강 방향 수정 핵심:
+     * - playerSlide 또는 매 프레임 변하는 climbPos 자체를 이동 중 판정으로 사용하지 않습니다.
+     * - CharacterInput.Sample 안에서 RealControl이 실제로 적용한 climbPos 변화만
+     *   새로운 스텝으로 인정합니다.
+     * - 이후에는 마지막 스텝 방향으로 진행한 실제 몸 이동량만 검사합니다.
+     *
+     * Reflection은 사용하지 않습니다.
      */
     internal static class AnimationFlow
     {
         /*
-         * climbPos가 이 값보다 많이 변하면
-         * RealControl에서 새로운 스텝 이동이 시작된 것으로 판단합니다.
-         */
-        private const float TargetChangeSqrMagnitude = 0.000001f;
-
-        /*
-         * 캐릭터 몸 중심이 벽 표면 방향으로 이 값보다 많이 움직이면
-         * 실제 이동 중인 것으로 판단합니다.
+         * CharacterInput.Sample 한 번 안에서 climbPos가 이 값보다 많이 변하면
+         * RealControl이 실제 스텝을 적용한 것으로 판단합니다.
          *
-         * 지나치게 낮으면 벽에서의 미세한 물리 흔들림까지
-         * 이동으로 판정할 수 있으므로 0.005m 기준을 사용합니다.
+         * RealControl의 최소 스텝 거리는 0.01m 이상이므로
+         * 0.001m 기준이면 정상 스텝은 놓치지 않습니다.
          */
-        private const float BodyMovementSqrMagnitude = 0.000025f;
+        private const float AppliedStepSqrMagnitude = 0.000001f;
 
         /*
-         * FixedUpdate와 Update 실행 시점 차이로 한두 프레임 이동량이
-         * 0으로 측정되는 경우가 있으므로 즉시 정지하지 않고
-         * 짧은 유예시간 뒤 현재 프레임을 고정합니다.
+         * 마지막 스텝 방향으로 프레임당 이 거리보다 많이 진행해야
+         * 실제 이동 중인 것으로 판정합니다.
+         *
+         * 방향성 있는 진행량만 사용하므로 S 방향의 벽 보정이나
+         * 반대 방향 미세 흔들림이 애니메이션을 계속 재생시키지 않습니다.
+         */
+        private const float MinimumDirectionalMovement = 0.0005f;
+
+        /*
+         * 스텝 직후에는 Update와 FixedUpdate 순서 차이로
+         * 실제 몸 이동이 아직 0으로 측정될 수 있습니다.
+         * 이 시간 동안은 애니메이션 재생을 보장합니다.
+         */
+        private const float MinimumStepAnimationTime = 0.12f;
+
+        /*
+         * 한두 프레임 실제 이동량이 작게 측정되더라도
+         * 즉시 끊기지 않도록 짧은 정지 유예시간을 둡니다.
          */
         private const float MovementStopGraceTime = 0.08f;
 
@@ -60,14 +77,18 @@ namespace Sapphire009.RealControlMod
         {
             public bool HasPositionSample;
             public bool HasDirectionalPose;
+            public bool StepActive;
             public bool IsFrozen;
 
+            public bool HasInputSampleSnapshot;
+
+            public float StepStartedTime;
             public float TimeWithoutMovement;
 
             public Vector2 LastDirection =
                 Vector2.zero;
 
-            public Vector3 LastClimbPosition =
+            public Vector3 InputSampleStartClimbPosition =
                 Vector3.zero;
 
             public Vector3 LastCharacterCenter =
@@ -131,9 +152,6 @@ namespace Sapphire009.RealControlMod
 
                 state.HasPositionSample =
                     true;
-
-                state.LastClimbPosition =
-                    character.data.climbPos;
 
                 state.LastCharacterCenter =
                     character.Center;
@@ -244,10 +262,7 @@ namespace Sapphire009.RealControlMod
             }
 
             /*
-             * PEAK 원본 CharacterAnimations.Update는
-             * movementInput.x/y를 그대로 "Input X/Y"에 넣습니다.
-             *
-             * 벽 위 실제 이동량을 동일한 입력값으로 역변환합니다.
+             * 벽 위 실제 이동 방향을 PEAK Animator의 Input X/Y로 변환합니다.
              *
              * W: ( 0,  1)
              * S: ( 0, -1)
@@ -273,6 +288,48 @@ namespace Sapphire009.RealControlMod
             }
 
             inputDirection.Normalize();
+            return true;
+        }
+
+        private static bool TryConvertInputToWorldDirection(
+            Character character,
+            Vector2 inputDirection,
+            out Vector3 worldDirection)
+        {
+            worldDirection =
+                Vector3.zero;
+
+            if (inputDirection.sqrMagnitude <=
+                MinimumDirectionSqrMagnitude)
+            {
+                return false;
+            }
+
+            Vector3 wallUp;
+            Vector3 wallRight;
+
+            if (!TryGetWallAxes(
+                    character,
+                    out wallUp,
+                    out wallRight))
+            {
+                return false;
+            }
+
+            worldDirection =
+                wallRight * inputDirection.x +
+                wallUp * inputDirection.y;
+
+            if (worldDirection.sqrMagnitude <=
+                MinimumDirectionSqrMagnitude)
+            {
+                worldDirection =
+                    Vector3.zero;
+
+                return false;
+            }
+
+            worldDirection.Normalize();
             return true;
         }
 
@@ -304,6 +361,44 @@ namespace Sapphire009.RealControlMod
                 Vector3.Dot(
                     worldMovement,
                     wallUp);
+        }
+
+        private static void BeginStepAnimation(
+            Character character,
+            AnimationFlowState state,
+            Vector2 direction)
+        {
+            if (character == null ||
+                state == null ||
+                direction.sqrMagnitude <=
+                    MinimumDirectionSqrMagnitude)
+            {
+                return;
+            }
+
+            direction.Normalize();
+
+            state.LastDirection =
+                direction;
+
+            state.HasDirectionalPose =
+                true;
+
+            state.StepActive =
+                true;
+
+            state.IsFrozen =
+                false;
+
+            state.StepStartedTime =
+                Time.unscaledTime;
+
+            state.TimeWithoutMovement =
+                0f;
+
+            ResumeAnimation(
+                character,
+                state);
         }
 
         private static void ApplyDirectionalAnimation(
@@ -386,6 +481,9 @@ namespace Sapphire009.RealControlMod
 
             state.IsFrozen =
                 true;
+
+            state.StepActive =
+                false;
         }
 
         private static void RestoreAndRemoveState(
@@ -434,9 +532,6 @@ namespace Sapphire009.RealControlMod
                 GetOrCreateState(
                     character);
 
-            Vector3 currentClimbPosition =
-                character.data.climbPos;
-
             Vector3 currentCharacterCenter =
                 character.Center;
 
@@ -445,18 +540,11 @@ namespace Sapphire009.RealControlMod
                 state.HasPositionSample =
                     true;
 
-                state.LastClimbPosition =
-                    currentClimbPosition;
-
                 state.LastCharacterCenter =
                     currentCharacterCenter;
 
                 return;
             }
-
-            Vector3 targetMovement =
-                currentClimbPosition -
-                state.LastClimbPosition;
 
             Vector3 bodyMovement =
                 currentCharacterCenter -
@@ -467,93 +555,90 @@ namespace Sapphire009.RealControlMod
                     character,
                     bodyMovement);
 
-            bool targetChanged =
-                targetMovement.sqrMagnitude >
-                TargetChangeSqrMagnitude;
+            bool movingInRequestedDirection =
+                false;
 
-            bool bodyIsMoving =
-                surfaceBodyMovement.sqrMagnitude >
-                BodyMovementSqrMagnitude;
-
-            /*
-             * RealControl이 climbPos를 바꾸는 순간에는
-             * 실제 몸이 움직이기 전이라도 방향을 즉시 확보합니다.
-             */
-            if (targetChanged)
+            if (state.StepActive &&
+                state.HasDirectionalPose)
             {
-                Vector2 requestedDirection;
+                Vector3 requestedWorldDirection;
 
-                if (TryConvertWorldMovementToInput(
+                if (TryConvertInputToWorldDirection(
                         character,
-                        targetMovement,
-                        out requestedDirection))
+                        state.LastDirection,
+                        out requestedWorldDirection))
                 {
-                    state.LastDirection =
-                        requestedDirection;
+                    /*
+                     * 이동량의 크기만 보지 않고 마지막 스텝 방향으로
+                     * 실제 진행한 거리만 사용합니다.
+                     *
+                     * 특히 S 방향에서는 PEAK의 하강 보정이나 벽 표면의
+                     * 미세 흔들림이 있더라도 요청 방향으로 충분히 진행하지
+                     * 않았다면 이동 중으로 판정하지 않습니다.
+                     */
+                    float directionalMovement =
+                        Vector3.Dot(
+                            surfaceBodyMovement,
+                            requestedWorldDirection);
 
-                    state.HasDirectionalPose =
-                        true;
-                }
-            }
-            else if (bodyIsMoving &&
-                     !state.HasDirectionalPose)
-            {
-                /*
-                 * 다른 코드에서 climbPos를 즉시 이동시키지 않는 경우를 위한
-                 * 보조 경로입니다. 실제 몸 이동 방향으로 원본 입력값을 복원합니다.
-                 */
-                Vector2 actualDirection;
-
-                if (TryConvertWorldMovementToInput(
-                        character,
-                        surfaceBodyMovement,
-                        out actualDirection))
-                {
-                    state.LastDirection =
-                        actualDirection;
-
-                    state.HasDirectionalPose =
-                        true;
+                    movingInRequestedDirection =
+                        directionalMovement >
+                        MinimumDirectionalMovement;
                 }
             }
 
-            bool animationShouldMove =
-                state.HasDirectionalPose &&
-                (targetChanged ||
-                 bodyIsMoving);
-
-            if (animationShouldMove)
+            if (state.StepActive &&
+                state.HasDirectionalPose)
             {
-                state.TimeWithoutMovement =
-                    0f;
+                float stepElapsed =
+                    Time.unscaledTime -
+                    state.StepStartedTime;
 
-                ResumeAnimation(
-                    character,
-                    state);
-            }
-            else if (state.HasDirectionalPose)
-            {
-                state.TimeWithoutMovement +=
-                    Time.unscaledDeltaTime;
-
-                if (state.TimeWithoutMovement >=
-                    MovementStopGraceTime)
+                if (movingInRequestedDirection ||
+                    stepElapsed <
+                    MinimumStepAnimationTime)
                 {
-                    FreezeAnimation(
+                    state.TimeWithoutMovement =
+                        0f;
+
+                    ResumeAnimation(
                         character,
                         state);
                 }
                 else
                 {
-                    /*
-                     * Update와 FixedUpdate 사이에서 한 프레임 이동량이
-                     * 0으로 보이더라도 즉시 끊기지 않게 마지막 방향으로
-                     * 애니메이션을 계속 재생합니다.
-                     */
-                    ResumeAnimation(
-                        character,
-                        state);
+                    state.TimeWithoutMovement +=
+                        Time.unscaledDeltaTime;
+
+                    if (state.TimeWithoutMovement >=
+                        MovementStopGraceTime)
+                    {
+                        FreezeAnimation(
+                            character,
+                            state);
+                    }
+                    else
+                    {
+                        /*
+                         * Update와 FixedUpdate 사이에서 한 프레임 이동량이
+                         * 작게 보이더라도 즉시 끊기지 않게 마지막 방향으로
+                         * 애니메이션을 잠시 계속 재생합니다.
+                         */
+                        ResumeAnimation(
+                            character,
+                            state);
+                    }
                 }
+            }
+            else if (state.HasDirectionalPose)
+            {
+                /*
+                 * PEAK 원본 CharacterAnimations.Update가 매 프레임 실행되므로
+                 * 이동이 끝난 뒤에도 마지막 방향과 speed 0을 다시 적용합니다.
+                 */
+                FreezeAnimation(
+                    character,
+                    state);
             }
             else
             {
@@ -566,11 +651,110 @@ namespace Sapphire009.RealControlMod
                     false);
             }
 
-            state.LastClimbPosition =
-                currentClimbPosition;
-
             state.LastCharacterCenter =
                 currentCharacterCenter;
+        }
+
+        /*
+         * CharacterInput.Sample 실행 전 climbPos를 저장하고,
+         * RealControl의 Sample Postfix가 끝난 뒤 실제 적용된 차이를 확인합니다.
+         *
+         * 이 방식은 다음 문제를 피합니다.
+         * - RealControl이 playerSlide를 0으로 비우므로 playerSlide 기반 판정이 불가능한 문제
+         * - PEAK가 FixedUpdate에서 climbPos를 계속 벽 표면에 보정하여
+         *   S 방향을 지속 이동으로 오인하는 문제
+         */
+        [HarmonyPatch(
+            typeof(CharacterInput),
+            "Sample",
+            new Type[]
+            {
+                typeof(bool)
+            })]
+        private static class CharacterInputStepDetectionPatch
+        {
+            [HarmonyPrefix]
+            [HarmonyPriority(Priority.First)]
+            private static void Prefix(
+                CharacterInput __instance)
+            {
+                Character character =
+                    ResolveCharacter(
+                        __instance);
+
+                if (!IsLocalNormalWallClimbing(
+                        character))
+                {
+                    return;
+                }
+
+                AnimationFlowState state =
+                    GetOrCreateState(
+                        character);
+
+                state.InputSampleStartClimbPosition =
+                    character.data.climbPos;
+
+                state.HasInputSampleSnapshot =
+                    true;
+            }
+
+            /*
+             * RealControl의 CharacterInput.Sample Postfix보다 뒤에서 실행되어야
+             * 성공한 스텝으로 변경된 climbPos를 확인할 수 있습니다.
+             */
+            [HarmonyPostfix]
+            [HarmonyPriority(-200)]
+            private static void Postfix(
+                CharacterInput __instance)
+            {
+                Character character =
+                    ResolveCharacter(
+                        __instance);
+
+                if (!IsLocalNormalWallClimbing(
+                        character))
+                {
+                    return;
+                }
+
+                AnimationFlowState state =
+                    GetOrCreateState(
+                        character);
+
+                if (!state.HasInputSampleSnapshot)
+                {
+                    return;
+                }
+
+                state.HasInputSampleSnapshot =
+                    false;
+
+                Vector3 appliedStep =
+                    character.data.climbPos -
+                    state.InputSampleStartClimbPosition;
+
+                if (appliedStep.sqrMagnitude <=
+                    AppliedStepSqrMagnitude)
+                {
+                    return;
+                }
+
+                Vector2 appliedDirection;
+
+                if (!TryConvertWorldMovementToInput(
+                        character,
+                        appliedStep,
+                        out appliedDirection))
+                {
+                    return;
+                }
+
+                BeginStepAnimation(
+                    character,
+                    state,
+                    appliedDirection);
+            }
         }
 
         /*
@@ -583,7 +767,7 @@ namespace Sapphire009.RealControlMod
         private static class CharacterAnimationsFlowPatch
         {
             [HarmonyPostfix]
-            [HarmonyPriority(-100)]
+            [HarmonyPriority(-200)]
             private static void Postfix(
                 CharacterAnimations __instance)
             {
@@ -626,7 +810,7 @@ namespace Sapphire009.RealControlMod
         private static class StartClimbAnimationFlowPatch
         {
             [HarmonyPostfix]
-            [HarmonyPriority(-100)]
+            [HarmonyPriority(-200)]
             private static void Postfix(
                 CharacterClimbing __instance)
             {
@@ -658,7 +842,7 @@ namespace Sapphire009.RealControlMod
         private static class StopClimbAnimationFlowPatch
         {
             [HarmonyPostfix]
-            [HarmonyPriority(-100)]
+            [HarmonyPriority(-200)]
             private static void Postfix(
                 CharacterClimbing __instance)
             {
