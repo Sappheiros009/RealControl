@@ -11,9 +11,9 @@ public sealed class RealControl : BaseUnityPlugin
 {
     public const string PluginGUID = "Sapphire009.RealControl";
     public const string PluginName = "RealControl";
-    public const string PluginVersion = "1.0.0";
+    public const string PluginVersion = "1.0.1";
 
-    private const string BuildMarker = "DiscreteWallClimb-R1";
+    private const string BuildMarker = "DirectionalAlternatingInput-R2";
     private const float NormalGrabDetectionWindow = 0.75f;
     private const float MinimumDirectionSqrMagnitude = 0.0001f;
 
@@ -46,9 +46,6 @@ public sealed class RealControl : BaseUnityPlugin
     private sealed class InputState
     {
         public bool WasControlledWallClimbing;
-        public bool LeftKeyHeld;
-        public bool RightKeyHeld;
-        public bool DownKeyHeld;
         public float LastPrimaryPressedTime = float.NegativeInfinity;
         public ExpectedHand NextHand = ExpectedHand.Left;
     }
@@ -61,19 +58,19 @@ public sealed class RealControl : BaseUnityPlugin
             "Climb Step",
             "UpStepDistance",
             0.45f,
-            "좌클릭/우클릭 교대 입력 1회당 위로 이동할 거리입니다.");
+            "W를 누른 상태에서 올바른 좌클릭/우클릭 교대 입력 1회당 위로 이동할 거리입니다.");
 
         sideStepDistance = Config.Bind(
             "Climb Step",
             "SideStepDistance",
             0.45f,
-            "A 또는 D 입력 1회당 좌우로 이동할 거리입니다.");
+            "A 또는 D를 누른 상태에서 올바른 좌클릭/우클릭 교대 입력 1회당 좌우로 이동할 거리입니다.");
 
         downStepDistance = Config.Bind(
             "Climb Step",
             "DownStepDistance",
             0.45f,
-            "S 입력 1회당 아래로 이동할 거리입니다.");
+            "S를 누른 상태에서 올바른 좌클릭/우클릭 교대 입력 1회당 아래로 이동할 거리입니다.");
 
         logSuccessfulSteps = Config.Bind(
             "Debug",
@@ -105,8 +102,8 @@ public sealed class RealControl : BaseUnityPlugin
     private static InputState GetOrCreateState(CharacterInput characterInput)
     {
         int inputId = characterInput.GetInstanceID();
-        InputState state;
 
+        InputState state;
         if (!InputStates.TryGetValue(inputId, out state))
         {
             state = new InputState();
@@ -130,6 +127,16 @@ public sealed class RealControl : BaseUnityPlugin
                !character.data.isRopeClimbing &&
                !character.data.isVineClimbing &&
                character.data.currentClimbHandle == null;
+    }
+
+    private static bool ReadUpHeld(Vector2 sampledMovement)
+    {
+        if (CharacterInput.action_moveForward != null)
+        {
+            return CharacterInput.action_moveForward.IsPressed();
+        }
+
+        return sampledMovement.y > 0.5f;
     }
 
     private static bool ReadLeftHeld(Vector2 sampledMovement)
@@ -162,36 +169,58 @@ public sealed class RealControl : BaseUnityPlugin
         return sampledMovement.y < -0.5f;
     }
 
-    private static void UpdateHeldStates(
-        InputState state,
+    private static bool TryGetHeldDirection(
+        bool upHeld,
         bool leftHeld,
         bool rightHeld,
-        bool downHeld)
+        bool downHeld,
+        out StepDirection stepDirection)
     {
-        state.LeftKeyHeld = leftHeld;
-        state.RightKeyHeld = rightHeld;
-        state.DownKeyHeld = downHeld;
+        stepDirection = StepDirection.Up;
+        int heldDirectionCount = 0;
+
+        if (upHeld)
+        {
+            stepDirection = StepDirection.Up;
+            heldDirectionCount++;
+        }
+
+        if (downHeld)
+        {
+            stepDirection = StepDirection.Down;
+            heldDirectionCount++;
+        }
+
+        if (leftHeld)
+        {
+            stepDirection = StepDirection.Left;
+            heldDirectionCount++;
+        }
+
+        if (rightHeld)
+        {
+            stepDirection = StepDirection.Right;
+            heldDirectionCount++;
+        }
+
+        // 방향키가 없거나 둘 이상 동시에 눌린 경우에는 방향을 확정하지 않는다.
+        return heldDirectionCount == 1;
     }
 
     private static void BeginControlledClimb(
         Character character,
-        InputState state,
-        bool leftHeld,
-        bool rightHeld,
-        bool downHeld)
+        InputState state)
     {
         bool startedByNormalLeftClick =
             Time.unscaledTime - state.LastPrimaryPressedTime <=
             NormalGrabDetectionWindow;
 
         // 일반 벽잡기의 좌클릭을 첫 손동작으로 계산한다.
-        // 따라서 정상적으로 좌클릭해서 벽을 잡았다면 첫 상승 입력은 우클릭이다.
-        // 점프 자동 벽잡기처럼 좌클릭 없이 잡았다면 첫 상승 입력은 좌클릭이다.
+        // 정상적으로 좌클릭해서 벽을 잡았다면 다음 이동 입력은 우클릭이다.
+        // 점프 자동 벽잡기처럼 좌클릭 없이 잡았다면 다음 이동 입력은 좌클릭이다.
         state.NextHand = startedByNormalLeftClick
             ? ExpectedHand.Right
             : ExpectedHand.Left;
-
-        UpdateHeldStates(state, leftHeld, rightHeld, downHeld);
 
         character.refs.climbing.playerSlide = Vector2.zero;
         state.WasControlledWallClimbing = true;
@@ -207,7 +236,6 @@ public sealed class RealControl : BaseUnityPlugin
         }
 
         Vector3 wallNormal = character.data.climbNormal;
-
         if (wallNormal.sqrMagnitude < MinimumDirectionSqrMagnitude)
         {
             return false;
@@ -216,7 +244,6 @@ public sealed class RealControl : BaseUnityPlugin
         wallNormal.Normalize();
 
         Vector3 wallUp = Vector3.ProjectOnPlane(Vector3.up, wallNormal);
-
         if (wallUp.sqrMagnitude < MinimumDirectionSqrMagnitude)
         {
             return false;
@@ -225,7 +252,6 @@ public sealed class RealControl : BaseUnityPlugin
         wallUp.Normalize();
 
         Vector3 wallRight = Vector3.Cross(wallNormal, wallUp);
-
         if (wallRight.sqrMagnitude < MinimumDirectionSqrMagnitude)
         {
             return false;
@@ -238,19 +264,27 @@ public sealed class RealControl : BaseUnityPlugin
         switch (stepDirection)
         {
             case StepDirection.Up:
-                stepVector = wallUp * Mathf.Max(0.01f, upStepDistance.Value);
+                stepVector =
+                    wallUp *
+                    Mathf.Max(0.01f, upStepDistance.Value);
                 break;
 
             case StepDirection.Down:
-                stepVector = -wallUp * Mathf.Max(0.01f, downStepDistance.Value);
+                stepVector =
+                    -wallUp *
+                    Mathf.Max(0.01f, downStepDistance.Value);
                 break;
 
             case StepDirection.Left:
-                stepVector = -wallRight * Mathf.Max(0.01f, sideStepDistance.Value);
+                stepVector =
+                    -wallRight *
+                    Mathf.Max(0.01f, sideStepDistance.Value);
                 break;
 
             case StepDirection.Right:
-                stepVector = wallRight * Mathf.Max(0.01f, sideStepDistance.Value);
+                stepVector =
+                    wallRight *
+                    Mathf.Max(0.01f, sideStepDistance.Value);
                 break;
         }
 
@@ -281,48 +315,50 @@ public sealed class RealControl : BaseUnityPlugin
         CharacterInput characterInput,
         Character character,
         InputState state,
-        bool leftPressed,
-        bool rightPressed,
-        bool downPressed)
+        bool upHeld,
+        bool leftHeld,
+        bool rightHeld,
+        bool downHeld)
     {
-        bool primaryPressed = characterInput.usePrimaryWasPressed;
-        bool secondaryPressed = characterInput.useSecondaryWasPressed;
+        bool primaryPressed =
+            characterInput.usePrimaryWasPressed;
 
-        // W/A/S/D를 꾹 눌러도 원본 연속 이동이 발생하지 않게 한다.
+        bool secondaryPressed =
+            characterInput.useSecondaryWasPressed;
+
+        // W/A/S/D를 꾹 눌러도 PEAK 원본의
+        // 연속 등반 이동이 발생하지 않게 한다.
         characterInput.movementInput = Vector2.zero;
 
         // 원본은 좌클릭 해제 시 벽을 놓지만,
-        // 이 모드는 좌/우 클릭 교대가 필요하므로 해제를 무시한다.
+        // 이 모드는 좌클릭/우클릭 교대가 필요하므로 해제를 무시한다.
         // 벽을 놓으려면 원본과 동일하게 스페이스바를 사용한다.
         characterInput.usePrimaryWasReleased = false;
 
-        if (primaryPressed)
+        bool expectedClickPressed =
+            state.NextHand == ExpectedHand.Left
+                ? primaryPressed
+                : secondaryPressed;
+
+        if (expectedClickPressed)
         {
-            if (state.NextHand == ExpectedHand.Left &&
-                TryApplyStep(character, StepDirection.Up))
+            StepDirection stepDirection;
+
+            // 반드시 방향키 하나를 누른 상태에서
+            // 올바른 손의 클릭이 들어와야 이동한다.
+            if (TryGetHeldDirection(
+                    upHeld,
+                    leftHeld,
+                    rightHeld,
+                    downHeld,
+                    out stepDirection) &&
+                TryApplyStep(character, stepDirection))
             {
-                state.NextHand = ExpectedHand.Right;
+                state.NextHand =
+                    state.NextHand == ExpectedHand.Left
+                        ? ExpectedHand.Right
+                        : ExpectedHand.Left;
             }
-        }
-        else if (secondaryPressed)
-        {
-            if (state.NextHand == ExpectedHand.Right &&
-                TryApplyStep(character, StepDirection.Up))
-            {
-                state.NextHand = ExpectedHand.Left;
-            }
-        }
-        else if (leftPressed)
-        {
-            TryApplyStep(character, StepDirection.Left);
-        }
-        else if (rightPressed)
-        {
-            TryApplyStep(character, StepDirection.Right);
-        }
-        else if (downPressed)
-        {
-            TryApplyStep(character, StepDirection.Down);
         }
 
         // 등반 중 마우스 입력은 RealControl이 소비한다.
@@ -357,23 +393,31 @@ public sealed class RealControl : BaseUnityPlugin
                 return;
             }
 
-            Character character = __instance.GetComponent<Character>();
+            Character character =
+                __instance.GetComponent<Character>();
 
             if (character == null || !character.IsLocal)
             {
                 return;
             }
 
-            InputState state = GetOrCreateState(__instance);
-            Vector2 sampledMovement = __instance.movementInput;
+            InputState state =
+                GetOrCreateState(__instance);
 
-            bool leftHeld = ReadLeftHeld(sampledMovement);
-            bool rightHeld = ReadRightHeld(sampledMovement);
-            bool downHeld = ReadDownHeld(sampledMovement);
+            Vector2 sampledMovement =
+                __instance.movementInput;
 
-            bool leftPressed = leftHeld && !state.LeftKeyHeld;
-            bool rightPressed = rightHeld && !state.RightKeyHeld;
-            bool downPressed = downHeld && !state.DownKeyHeld;
+            bool upHeld =
+                ReadUpHeld(sampledMovement);
+
+            bool leftHeld =
+                ReadLeftHeld(sampledMovement);
+
+            bool rightHeld =
+                ReadRightHeld(sampledMovement);
+
+            bool downHeld =
+                ReadDownHeld(sampledMovement);
 
             bool controlledWallClimbing =
                 IsControlledWallClimbing(character);
@@ -382,11 +426,11 @@ public sealed class RealControl : BaseUnityPlugin
             {
                 if (__instance.usePrimaryWasPressed)
                 {
-                    state.LastPrimaryPressedTime = Time.unscaledTime;
+                    state.LastPrimaryPressedTime =
+                        Time.unscaledTime;
                 }
 
                 state.WasControlledWallClimbing = false;
-                UpdateHeldStates(state, leftHeld, rightHeld, downHeld);
                 return;
             }
 
@@ -394,26 +438,17 @@ public sealed class RealControl : BaseUnityPlugin
             {
                 BeginControlledClimb(
                     character,
-                    state,
-                    leftHeld,
-                    rightHeld,
-                    downHeld);
-
-                // 벽을 잡기 전부터 누르고 있던 키는 스텝으로 계산하지 않는다.
-                leftPressed = false;
-                rightPressed = false;
-                downPressed = false;
+                    state);
             }
 
             ProcessControlledClimbInput(
                 __instance,
                 character,
                 state,
-                leftPressed,
-                rightPressed,
-                downPressed);
-
-            UpdateHeldStates(state, leftHeld, rightHeld, downHeld);
+                upHeld,
+                leftHeld,
+                rightHeld,
+                downHeld);
         }
     }
 }
