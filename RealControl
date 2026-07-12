@@ -7,7 +7,7 @@ using System.Collections.Generic;
 using UnityEngine;
 
 [BepInPlugin(PluginGUID, PluginName, PluginVersion)]
-public sealed class RealControl : BaseUnityPlugin
+public sealed class RealControlPlugin : BaseUnityPlugin
 {
     public const string PluginGUID = "Sapphire009.RealControl";
     public const string PluginName = "RealControl";
