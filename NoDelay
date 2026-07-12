@@ -1,13 +1,44 @@
 using HarmonyLib;
 using System;
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace Sapphire009.RealControlMod
 {
     internal static class NoDelay
     {
+        // 기존 등반 점프 재입력 대기시간 단축값
         private const float ShortClimbDelay = 0.5f;
         private const float ReadyClimbJumpTime = 2f;
+
+        // 좌클릭과 우클릭을 번갈아 입력할 때 필요한 최소 간격
+        private const float MouseAlternationDelay = 0.5f;
+
+        // 일반 좌클릭으로 벽을 잡았는지 판정하는 시간 범위
+        private const float NormalGrabDetectionWindow = 0.75f;
+
+        private static readonly Dictionary<int, MouseDelayState> MouseDelayStates =
+            new Dictionary<int, MouseDelayState>();
+
+        private enum MouseHand
+        {
+            None,
+            Left,
+            Right
+        }
+
+        private sealed class MouseDelayState
+        {
+            public bool WasNormalWallClimbing;
+
+            public MouseHand LastAcceptedHand = MouseHand.None;
+
+            public float LastAcceptedClickTime =
+                float.NegativeInfinity;
+
+            public float LastPrimaryPressedTime =
+                float.NegativeInfinity;
+        }
 
         private static Character ResolveCharacter(
             Component component)
@@ -29,12 +60,40 @@ namespace Sapphire009.RealControlMod
             return character;
         }
 
+        private static MouseDelayState GetOrCreateMouseDelayState(
+            Character character)
+        {
+            int characterId =
+                character.GetInstanceID();
+
+            MouseDelayState state;
+
+            if (!MouseDelayStates.TryGetValue(
+                    characterId,
+                    out state))
+            {
+                state = new MouseDelayState();
+
+                MouseDelayStates.Add(
+                    characterId,
+                    state);
+            }
+
+            return state;
+        }
+
+        private static bool IsLocalCharacter(
+            Character character)
+        {
+            return character != null &&
+                   character.IsLocal &&
+                   character.data != null;
+        }
+
         private static bool IsLocalNormalWallClimbing(
             Character character)
         {
-            if (character == null ||
-                !character.IsLocal ||
-                character.data == null)
+            if (!IsLocalCharacter(character))
             {
                 return false;
             }
@@ -65,6 +124,253 @@ namespace Sapphire009.RealControlMod
             }
         }
 
+        private static void ResetMouseAlternation(
+            MouseDelayState state)
+        {
+            state.LastAcceptedHand =
+                MouseHand.None;
+
+            state.LastAcceptedClickTime =
+                float.NegativeInfinity;
+        }
+
+        private static void BeginMouseAlternationForClimb(
+            MouseDelayState state)
+        {
+            bool startedByRecentPrimaryClick =
+                Time.unscaledTime -
+                state.LastPrimaryPressedTime <=
+                NormalGrabDetectionWindow;
+
+            if (startedByRecentPrimaryClick)
+            {
+                // 벽을 잡을 때 사용한 좌클릭도 첫 손동작으로 계산한다.
+                // 따라서 다음 우클릭은 이 시점에서 0.5초가 지난 뒤에만 허용된다.
+                state.LastAcceptedHand =
+                    MouseHand.Left;
+
+                state.LastAcceptedClickTime =
+                    state.LastPrimaryPressedTime;
+            }
+            else
+            {
+                // 점프 자동 벽잡기처럼 좌클릭 없이 시작한 경우
+                // 첫 번째 마우스 입력은 즉시 허용한다.
+                ResetMouseAlternation(state);
+            }
+
+            state.WasNormalWallClimbing = true;
+        }
+
+        private static bool CanAcceptOppositeClick(
+            MouseDelayState state,
+            MouseHand pressedHand)
+        {
+            if (state.LastAcceptedHand ==
+                MouseHand.None)
+            {
+                return true;
+            }
+
+            // 같은 손을 연속으로 누르는 입력은 RealControl의
+            // 좌우 교대 규칙에 맞지 않으므로 받아들이지 않는다.
+            if (state.LastAcceptedHand ==
+                pressedHand)
+            {
+                return false;
+            }
+
+            float elapsed =
+                Time.unscaledTime -
+                state.LastAcceptedClickTime;
+
+            return elapsed >=
+                   MouseAlternationDelay;
+        }
+
+        private static void AcceptClick(
+            MouseDelayState state,
+            MouseHand pressedHand)
+        {
+            state.LastAcceptedHand =
+                pressedHand;
+
+            state.LastAcceptedClickTime =
+                Time.unscaledTime;
+        }
+
+        private static void SuppressPrimaryClick(
+            CharacterInput characterInput)
+        {
+            characterInput.usePrimaryWasPressed =
+                false;
+
+            characterInput.usePrimaryIsPressed =
+                false;
+        }
+
+        private static void SuppressSecondaryClick(
+            CharacterInput characterInput)
+        {
+            characterInput.useSecondaryWasPressed =
+                false;
+
+            characterInput.useSecondaryIsPressed =
+                false;
+        }
+
+        private static void ProcessPrimaryClick(
+            CharacterInput characterInput,
+            MouseDelayState state)
+        {
+            if (!characterInput.usePrimaryWasPressed)
+            {
+                return;
+            }
+
+            if (!CanAcceptOppositeClick(
+                    state,
+                    MouseHand.Left))
+            {
+                SuppressPrimaryClick(
+                    characterInput);
+
+                return;
+            }
+
+            AcceptClick(
+                state,
+                MouseHand.Left);
+        }
+
+        private static void ProcessSecondaryClick(
+            CharacterInput characterInput,
+            MouseDelayState state)
+        {
+            if (!characterInput.useSecondaryWasPressed)
+            {
+                return;
+            }
+
+            if (!CanAcceptOppositeClick(
+                    state,
+                    MouseHand.Right))
+            {
+                SuppressSecondaryClick(
+                    characterInput);
+
+                return;
+            }
+
+            AcceptClick(
+                state,
+                MouseHand.Right);
+        }
+
+        private static void ApplyMouseAlternationDelay(
+            CharacterInput characterInput,
+            Character character)
+        {
+            if (!IsLocalCharacter(character))
+            {
+                return;
+            }
+
+            MouseDelayState state =
+                GetOrCreateMouseDelayState(
+                    character);
+
+            bool normalWallClimbing =
+                IsLocalNormalWallClimbing(
+                    character);
+
+            if (!normalWallClimbing)
+            {
+                // 벽을 잡기 직전 좌클릭 시각을 보관한다.
+                if (characterInput.usePrimaryWasPressed)
+                {
+                    state.LastPrimaryPressedTime =
+                        Time.unscaledTime;
+                }
+
+                state.WasNormalWallClimbing =
+                    false;
+
+                ResetMouseAlternation(
+                    state);
+
+                return;
+            }
+
+            if (!state.WasNormalWallClimbing)
+            {
+                // 등반이 같은 Sample 안에서 시작된 경우에도
+                // 현재 좌클릭을 일반 벽잡기 입력으로 기록한다.
+                if (characterInput.usePrimaryWasPressed)
+                {
+                    state.LastPrimaryPressedTime =
+                        Time.unscaledTime;
+                }
+
+                BeginMouseAlternationForClimb(
+                    state);
+            }
+
+            bool primaryPressed =
+                characterInput.usePrimaryWasPressed;
+
+            bool secondaryPressed =
+                characterInput.useSecondaryWasPressed;
+
+            if (primaryPressed &&
+                secondaryPressed)
+            {
+                // 양쪽 버튼이 같은 프레임에 눌렸다면
+                // 마지막으로 인정된 손의 반대쪽만 후보로 남긴다.
+                if (state.LastAcceptedHand ==
+                    MouseHand.Left)
+                {
+                    SuppressPrimaryClick(
+                        characterInput);
+
+                    ProcessSecondaryClick(
+                        characterInput,
+                        state);
+                }
+                else if (state.LastAcceptedHand ==
+                         MouseHand.Right)
+                {
+                    SuppressSecondaryClick(
+                        characterInput);
+
+                    ProcessPrimaryClick(
+                        characterInput,
+                        state);
+                }
+                else
+                {
+                    // 첫 입력에서 양쪽을 동시에 누르면
+                    // 좌클릭 하나만 첫 입력으로 인정한다.
+                    SuppressSecondaryClick(
+                        characterInput);
+
+                    ProcessPrimaryClick(
+                        characterInput,
+                        state);
+                }
+
+                return;
+            }
+
+            ProcessPrimaryClick(
+                characterInput,
+                state);
+
+            ProcessSecondaryClick(
+                characterInput,
+                state);
+        }
+
         [HarmonyPatch(
             typeof(CharacterInput),
             "Sample",
@@ -83,6 +389,26 @@ namespace Sapphire009.RealControlMod
                     ResolveCharacter(__instance);
 
                 UpdateShortDelay(
+                    character);
+            }
+
+            // RealControl의 Priority.Last Postfix보다 먼저 실행되어
+            // 0.5초가 지나지 않은 클릭을 RealControl이 읽기 전에 차단한다.
+            [HarmonyPostfix]
+            [HarmonyPriority(Priority.First)]
+            private static void Postfix(
+                CharacterInput __instance)
+            {
+                if (__instance == null)
+                {
+                    return;
+                }
+
+                Character character =
+                    ResolveCharacter(__instance);
+
+                ApplyMouseAlternationDelay(
+                    __instance,
                     character);
             }
         }
@@ -137,6 +463,13 @@ namespace Sapphire009.RealControlMod
 
                 character.data.sinceClimbJump =
                     0f;
+
+                MouseDelayState state =
+                    GetOrCreateMouseDelayState(
+                        character);
+
+                BeginMouseAlternationForClimb(
+                    state);
             }
         }
     }
