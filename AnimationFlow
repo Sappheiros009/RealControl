@@ -6,15 +6,42 @@ using UnityEngine;
 namespace Sapphire009.RealControlMod
 {
     /*
-     * RealControlPlugin의 harmony.PatchAll()에 의해 함께 적용됩니다.
+     * RealControl의 harmony.PatchAll()에 의해 함께 적용됩니다.
      *
      * 별도의 BepInPlugin을 선언하지 않으므로
      * RealControl.dll 하나 안에서 동작합니다.
+     *
+     * 동작 목표:
+     * 1. RealControl이 climbPos를 변경하면 PEAK 원본 WASD 등반 애니메이션을 재생합니다.
+     * 2. 캐릭터가 해당 목표점으로 이동하는 동안 애니메이션을 계속 재생합니다.
+     * 3. 이동이 끝나면 현재 애니메이션 프레임에서 정지합니다.
+     * 4. 다음 스텝이 시작되면 멈췄던 프레임부터 이어서 재생합니다.
      */
     internal static class AnimationFlow
     {
-        private const float ActiveMovementSqrMagnitude = 0.0025f;
-        private const float MinimumDirectionSqrMagnitude = 0.01f;
+        /*
+         * climbPos가 이 값보다 많이 변하면
+         * RealControl에서 새로운 스텝 이동이 시작된 것으로 판단합니다.
+         */
+        private const float TargetChangeSqrMagnitude = 0.000001f;
+
+        /*
+         * 캐릭터 몸 중심이 벽 표면 방향으로 이 값보다 많이 움직이면
+         * 실제 이동 중인 것으로 판단합니다.
+         *
+         * 지나치게 낮으면 벽에서의 미세한 물리 흔들림까지
+         * 이동으로 판정할 수 있으므로 0.005m 기준을 사용합니다.
+         */
+        private const float BodyMovementSqrMagnitude = 0.000025f;
+
+        /*
+         * FixedUpdate와 Update 실행 시점 차이로 한두 프레임 이동량이
+         * 0으로 측정되는 경우가 있으므로 즉시 정지하지 않고
+         * 짧은 유예시간 뒤 현재 프레임을 고정합니다.
+         */
+        private const float MovementStopGraceTime = 0.08f;
+
+        private const float MinimumDirectionSqrMagnitude = 0.0001f;
         private const float MinimumAnimationSpeed = 0.01f;
 
         private static readonly int ClimbJumpAnimationHash =
@@ -31,12 +58,20 @@ namespace Sapphire009.RealControlMod
 
         private sealed class AnimationFlowState
         {
+            public bool HasPositionSample;
             public bool HasDirectionalPose;
-
             public bool IsFrozen;
+
+            public float TimeWithoutMovement;
 
             public Vector2 LastDirection =
                 Vector2.zero;
+
+            public Vector3 LastClimbPosition =
+                Vector3.zero;
+
+            public Vector3 LastCharacterCenter =
+                Vector3.zero;
         }
 
         private static Character ResolveCharacter(
@@ -59,29 +94,6 @@ namespace Sapphire009.RealControlMod
             return character;
         }
 
-        private static AnimationFlowState GetOrCreateState(
-            Character character)
-        {
-            int characterId =
-                character.GetInstanceID();
-
-            AnimationFlowState state;
-
-            if (!FlowStates.TryGetValue(
-                    characterId,
-                    out state))
-            {
-                state =
-                    new AnimationFlowState();
-
-                FlowStates.Add(
-                    characterId,
-                    state);
-            }
-
-            return state;
-        }
-
         private static bool IsLocalNormalWallClimbing(
             Character character)
         {
@@ -102,6 +114,38 @@ namespace Sapphire009.RealControlMod
                 character.data.currentClimbHandle == null;
         }
 
+        private static AnimationFlowState GetOrCreateState(
+            Character character)
+        {
+            int characterId =
+                character.GetInstanceID();
+
+            AnimationFlowState state;
+
+            if (!FlowStates.TryGetValue(
+                    characterId,
+                    out state))
+            {
+                state =
+                    new AnimationFlowState();
+
+                state.HasPositionSample =
+                    true;
+
+                state.LastClimbPosition =
+                    character.data.climbPos;
+
+                state.LastCharacterCenter =
+                    character.Center;
+
+                FlowStates.Add(
+                    characterId,
+                    state);
+            }
+
+            return state;
+        }
+
         private static float GetClimbAnimationSpeed(
             Character character)
         {
@@ -111,9 +155,237 @@ namespace Sapphire009.RealControlMod
                 return 1f;
             }
 
+            /*
+             * PEAK 원본 CharacterAnimations.SetAnimSpeed와 동일하게
+             * 등반 중에는 staminaMod를 애니메이션 속도로 사용합니다.
+             */
             return Mathf.Max(
                 MinimumAnimationSpeed,
                 character.data.staminaMod);
+        }
+
+        private static bool TryGetWallAxes(
+            Character character,
+            out Vector3 wallUp,
+            out Vector3 wallRight)
+        {
+            wallUp =
+                Vector3.zero;
+
+            wallRight =
+                Vector3.zero;
+
+            if (character == null ||
+                character.data == null)
+            {
+                return false;
+            }
+
+            Vector3 wallNormal =
+                character.data.climbNormal;
+
+            if (wallNormal.sqrMagnitude <=
+                MinimumDirectionSqrMagnitude)
+            {
+                return false;
+            }
+
+            wallNormal.Normalize();
+
+            wallUp =
+                Vector3.ProjectOnPlane(
+                    Vector3.up,
+                    wallNormal);
+
+            if (wallUp.sqrMagnitude <=
+                MinimumDirectionSqrMagnitude)
+            {
+                return false;
+            }
+
+            wallUp.Normalize();
+
+            /*
+             * RealControl.cs가 사용하는 벽의 좌우축과
+             * 동일한 계산 순서를 사용합니다.
+             */
+            wallRight =
+                Vector3.Cross(
+                    wallNormal,
+                    wallUp);
+
+            if (wallRight.sqrMagnitude <=
+                MinimumDirectionSqrMagnitude)
+            {
+                return false;
+            }
+
+            wallRight.Normalize();
+            return true;
+        }
+
+        private static bool TryConvertWorldMovementToInput(
+            Character character,
+            Vector3 worldMovement,
+            out Vector2 inputDirection)
+        {
+            inputDirection =
+                Vector2.zero;
+
+            Vector3 wallUp;
+            Vector3 wallRight;
+
+            if (!TryGetWallAxes(
+                    character,
+                    out wallUp,
+                    out wallRight))
+            {
+                return false;
+            }
+
+            /*
+             * PEAK 원본 CharacterAnimations.Update는
+             * movementInput.x/y를 그대로 "Input X/Y"에 넣습니다.
+             *
+             * 벽 위 실제 이동량을 동일한 입력값으로 역변환합니다.
+             *
+             * W: ( 0,  1)
+             * S: ( 0, -1)
+             * A: (-1,  0)
+             * D: ( 1,  0)
+             */
+            inputDirection =
+                new Vector2(
+                    Vector3.Dot(
+                        worldMovement,
+                        wallRight),
+                    Vector3.Dot(
+                        worldMovement,
+                        wallUp));
+
+            if (inputDirection.sqrMagnitude <=
+                MinimumDirectionSqrMagnitude)
+            {
+                inputDirection =
+                    Vector2.zero;
+
+                return false;
+            }
+
+            inputDirection.Normalize();
+            return true;
+        }
+
+        private static Vector3 GetWallSurfaceMovement(
+            Character character,
+            Vector3 worldMovement)
+        {
+            Vector3 wallUp;
+            Vector3 wallRight;
+
+            if (!TryGetWallAxes(
+                    character,
+                    out wallUp,
+                    out wallRight))
+            {
+                return Vector3.zero;
+            }
+
+            /*
+             * 벽 안팎으로 흔들리는 물리 이동은 무시하고,
+             * 벽의 상하좌우 방향으로 실제 이동한 양만 계산합니다.
+             */
+            return
+                wallRight *
+                Vector3.Dot(
+                    worldMovement,
+                    wallRight) +
+                wallUp *
+                Vector3.Dot(
+                    worldMovement,
+                    wallUp);
+        }
+
+        private static void ApplyDirectionalAnimation(
+            Animator animator,
+            Vector2 direction)
+        {
+            /*
+             * 원본 CharacterAnimations.Update는 RealControl이
+             * movementInput을 0으로 지운 뒤 Input X/Y를 다시 0으로 만듭니다.
+             *
+             * 따라서 Postfix에서 방향값을 직접 복구해야
+             * PEAK 원본 WASD 등반 Blend Tree가 그대로 작동합니다.
+             */
+            animator.SetFloat(
+                InputXAnimationHash,
+                direction.x);
+
+            animator.SetFloat(
+                InputYAnimationHash,
+                direction.y);
+        }
+
+        private static void ResumeAnimation(
+            Character character,
+            AnimationFlowState state)
+        {
+            Animator animator =
+                character.refs.animator;
+
+            /*
+             * Shift용 Climb Jump 애니메이션 대신
+             * PEAK 원본 일반 WASD 등반 애니메이션을 사용합니다.
+             */
+            animator.SetBool(
+                ClimbJumpAnimationHash,
+                false);
+
+            ApplyDirectionalAnimation(
+                animator,
+                state.LastDirection);
+
+            /*
+             * Animator.Play를 호출하지 않습니다.
+             * speed만 복구하므로 이전에 멈춘 normalized time에서
+             * 그대로 이어서 재생됩니다.
+             */
+            animator.speed =
+                GetClimbAnimationSpeed(
+                    character);
+
+            state.IsFrozen =
+                false;
+        }
+
+        private static void FreezeAnimation(
+            Character character,
+            AnimationFlowState state)
+        {
+            Animator animator =
+                character.refs.animator;
+
+            animator.SetBool(
+                ClimbJumpAnimationHash,
+                false);
+
+            /*
+             * CharacterAnimations.Update가 Input X/Y를 0으로
+             * 되돌려도 마지막 이동 방향의 손 자세를 유지합니다.
+             */
+            ApplyDirectionalAnimation(
+                animator,
+                state.LastDirection);
+
+            /*
+             * 현재 재생 중인 정확한 프레임에서 정지합니다.
+             * 다음 스텝에서는 speed만 복구하므로 이 프레임부터 이어집니다.
+             */
+            animator.speed =
+                0f;
+
+            state.IsFrozen =
+                true;
         }
 
         private static void RestoreAndRemoveState(
@@ -129,10 +401,6 @@ namespace Sapphire009.RealControlMod
 
             AnimationFlowState state;
 
-            /*
-             * AnimationFlow가 실제로 관리하던 캐릭터만 복구합니다.
-             * 일반 상태의 Animator.speed를 매 프레임 1로 덮어쓰지 않습니다.
-             */
             if (!FlowStates.TryGetValue(
                     characterId,
                     out state))
@@ -140,13 +408,13 @@ namespace Sapphire009.RealControlMod
                 return;
             }
 
-            if (state.IsFrozen &&
-                character.refs != null &&
+            if (character.refs != null &&
                 character.refs.animator != null)
             {
                 /*
-                 * 벽에서 떨어진 뒤에도 Animator.speed가 0으로
-                 * 남아 캐릭터 전체 애니메이션이 멈추지 않게 복구합니다.
+                 * 벽을 놓은 뒤에도 Animator.speed가 0으로 남으면
+                 * 걷기, 점프 등 캐릭터 전체 애니메이션이 멈추므로
+                 * 반드시 원래 속도로 복구합니다.
                  */
                 character.refs.animator.speed =
                     1f;
@@ -156,12 +424,158 @@ namespace Sapphire009.RealControlMod
                 characterId);
         }
 
+        private static void UpdateAnimationFlow(
+            Character character)
+        {
+            Animator animator =
+                character.refs.animator;
+
+            AnimationFlowState state =
+                GetOrCreateState(
+                    character);
+
+            Vector3 currentClimbPosition =
+                character.data.climbPos;
+
+            Vector3 currentCharacterCenter =
+                character.Center;
+
+            if (!state.HasPositionSample)
+            {
+                state.HasPositionSample =
+                    true;
+
+                state.LastClimbPosition =
+                    currentClimbPosition;
+
+                state.LastCharacterCenter =
+                    currentCharacterCenter;
+
+                return;
+            }
+
+            Vector3 targetMovement =
+                currentClimbPosition -
+                state.LastClimbPosition;
+
+            Vector3 bodyMovement =
+                currentCharacterCenter -
+                state.LastCharacterCenter;
+
+            Vector3 surfaceBodyMovement =
+                GetWallSurfaceMovement(
+                    character,
+                    bodyMovement);
+
+            bool targetChanged =
+                targetMovement.sqrMagnitude >
+                TargetChangeSqrMagnitude;
+
+            bool bodyIsMoving =
+                surfaceBodyMovement.sqrMagnitude >
+                BodyMovementSqrMagnitude;
+
+            /*
+             * RealControl이 climbPos를 바꾸는 순간에는
+             * 실제 몸이 움직이기 전이라도 방향을 즉시 확보합니다.
+             */
+            if (targetChanged)
+            {
+                Vector2 requestedDirection;
+
+                if (TryConvertWorldMovementToInput(
+                        character,
+                        targetMovement,
+                        out requestedDirection))
+                {
+                    state.LastDirection =
+                        requestedDirection;
+
+                    state.HasDirectionalPose =
+                        true;
+                }
+            }
+            else if (bodyIsMoving &&
+                     !state.HasDirectionalPose)
+            {
+                /*
+                 * 다른 코드에서 climbPos를 즉시 이동시키지 않는 경우를 위한
+                 * 보조 경로입니다. 실제 몸 이동 방향으로 원본 입력값을 복원합니다.
+                 */
+                Vector2 actualDirection;
+
+                if (TryConvertWorldMovementToInput(
+                        character,
+                        surfaceBodyMovement,
+                        out actualDirection))
+                {
+                    state.LastDirection =
+                        actualDirection;
+
+                    state.HasDirectionalPose =
+                        true;
+                }
+            }
+
+            bool animationShouldMove =
+                state.HasDirectionalPose &&
+                (targetChanged ||
+                 bodyIsMoving);
+
+            if (animationShouldMove)
+            {
+                state.TimeWithoutMovement =
+                    0f;
+
+                ResumeAnimation(
+                    character,
+                    state);
+            }
+            else if (state.HasDirectionalPose)
+            {
+                state.TimeWithoutMovement +=
+                    Time.unscaledDeltaTime;
+
+                if (state.TimeWithoutMovement >=
+                    MovementStopGraceTime)
+                {
+                    FreezeAnimation(
+                        character,
+                        state);
+                }
+                else
+                {
+                    /*
+                     * Update와 FixedUpdate 사이에서 한 프레임 이동량이
+                     * 0으로 보이더라도 즉시 끊기지 않게 마지막 방향으로
+                     * 애니메이션을 계속 재생합니다.
+                     */
+                    ResumeAnimation(
+                        character,
+                        state);
+                }
+            }
+            else
+            {
+                /*
+                 * 아직 한 번도 방향 스텝을 실행하지 않았다면
+                 * 최초 벽잡기 자세와 속도는 PEAK 원본에 맡깁니다.
+                 */
+                animator.SetBool(
+                    ClimbJumpAnimationHash,
+                    false);
+            }
+
+            state.LastClimbPosition =
+                currentClimbPosition;
+
+            state.LastCharacterCenter =
+                currentCharacterCenter;
+        }
+
         /*
-         * CharacterAnimations.Update가 일반 벽잡기 자세로
-         * Input X/Y를 0으로 되돌린 뒤 가장 마지막에 실행됩니다.
-         *
-         * 움직이는 동안에는 애니메이션을 정상 재생하고,
-         * 움직임이 끝나면 마지막 방향과 현재 프레임을 그대로 멈춥니다.
+         * PEAK 원본 CharacterAnimations.Update가 모든 Animator 값을
+         * 갱신한 뒤 가장 마지막에 실행됩니다.
          */
         [HarmonyPatch(
             typeof(CharacterAnimations),
@@ -169,17 +583,13 @@ namespace Sapphire009.RealControlMod
         private static class CharacterAnimationsFlowPatch
         {
             [HarmonyPostfix]
-
-            /*
-             * RealControl.cs의 Priority.Last 패치보다도
-             * 나중에 실행되도록 더 낮은 우선순위를 사용합니다.
-             */
             [HarmonyPriority(-100)]
             private static void Postfix(
                 CharacterAnimations __instance)
             {
                 Character character =
-                    ResolveCharacter(__instance);
+                    ResolveCharacter(
+                        __instance);
 
                 if (character == null ||
                     !character.IsLocal)
@@ -196,113 +606,14 @@ namespace Sapphire009.RealControlMod
                     return;
                 }
 
-                Animator animator =
-                    character.refs.animator;
-
-                CharacterClimbing climbing =
-                    character.refs.climbing;
-
-                AnimationFlowState state =
-                    GetOrCreateState(
-                        character);
-
-                /*
-                 * Shift 전용 Climb Jump 애니메이션은 사용하지 않습니다.
-                 */
-                animator.SetBool(
-                    ClimbJumpAnimationHash,
-                    false);
-
-                bool isMoving =
-                    climbing.playerSlide.sqrMagnitude >
-                    ActiveMovementSqrMagnitude;
-
-                if (isMoving)
-                {
-                    Vector2 currentDirection =
-                        new Vector2(
-                            animator.GetFloat(
-                                InputXAnimationHash),
-                            animator.GetFloat(
-                                InputYAnimationHash));
-
-                    /*
-                     * RealControl이 넣은 W/A/S/D 방향을 저장합니다.
-                     */
-                    if (currentDirection.sqrMagnitude >
-                        MinimumDirectionSqrMagnitude)
-                    {
-                        state.LastDirection =
-                            currentDirection;
-
-                        state.HasDirectionalPose =
-                            true;
-                    }
-                    else if (state.HasDirectionalPose)
-                    {
-                        animator.SetFloat(
-                            InputXAnimationHash,
-                            state.LastDirection.x);
-
-                        animator.SetFloat(
-                            InputYAnimationHash,
-                            state.LastDirection.y);
-                    }
-
-                    /*
-                     * 이전 입력에서 멈춰 있던 현재 프레임부터
-                     * 애니메이션 재생을 그대로 이어갑니다.
-                     */
-                    animator.speed =
-                        GetClimbAnimationSpeed(
-                            character);
-
-                    state.IsFrozen =
-                        false;
-
-                    return;
-                }
-
-                /*
-                 * 아직 한 번도 방향 이동을 하지 않았다면
-                 * 최초 벽잡기 기본 자세는 원본대로 유지합니다.
-                 */
-                if (!state.HasDirectionalPose)
-                {
-                    return;
-                }
-
-                /*
-                 * W를 놓아도 Input Y를 0으로 되돌리지 않고
-                 * 마지막 W 방향값을 계속 유지합니다.
-                 *
-                 * A/S/D도 동일하게 마지막 방향을 유지합니다.
-                 */
-                animator.SetFloat(
-                    InputXAnimationHash,
-                    state.LastDirection.x);
-
-                animator.SetFloat(
-                    InputYAnimationHash,
-                    state.LastDirection.y);
-
-                /*
-                 * 현재 재생 중이던 정확한 프레임에서 멈춥니다.
-                 *
-                 * 다음 좌우클릭 이동이 시작되면 animator.speed가
-                 * 다시 복구되므로 멈춘 프레임부터 이어서 재생됩니다.
-                 */
-                animator.speed =
-                    0f;
-
-                state.IsFrozen =
-                    true;
+                UpdateAnimationFlow(
+                    character);
             }
         }
 
         /*
-         * 새로운 벽을 잡을 때는 이전 벽에서 저장된
-         * 애니메이션 방향과 정지 프레임을 초기화합니다.
+         * 새로운 벽을 잡을 때 이전 벽에서 저장한
+         * 방향과 정지 프레임 상태를 초기화합니다.
          */
         [HarmonyPatch(
             typeof(CharacterClimbing),
@@ -320,7 +631,8 @@ namespace Sapphire009.RealControlMod
                 CharacterClimbing __instance)
             {
                 Character character =
-                    ResolveCharacter(__instance);
+                    ResolveCharacter(
+                        __instance);
 
                 if (character == null ||
                     !character.IsLocal)
@@ -334,7 +646,7 @@ namespace Sapphire009.RealControlMod
         }
 
         /*
-         * 벽을 놓거나 추락할 때 Animator.speed를 1로 복구합니다.
+         * 벽을 놓거나 추락할 때 Animator.speed를 복구합니다.
          */
         [HarmonyPatch(
             typeof(CharacterClimbing),
@@ -351,7 +663,8 @@ namespace Sapphire009.RealControlMod
                 CharacterClimbing __instance)
             {
                 Character character =
-                    ResolveCharacter(__instance);
+                    ResolveCharacter(
+                        __instance);
 
                 if (character == null ||
                     !character.IsLocal)
