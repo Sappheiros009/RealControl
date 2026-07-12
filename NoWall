@@ -1,0 +1,1598 @@
+using HarmonyLib;
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace Sapphire009.RealControlMod
+{
+    /*
+     * RealControl의 harmony.PatchAll()에 의해 자동 적용되는 통합 클래스입니다.
+     *
+     * 이 클래스가 담당하는 기능:
+     * 1. 지상에서는 PEAK 원본 WASD 이동을 그대로 유지합니다.
+     * 2. 일반 벽 등반 중에는 WASD만 눌러서는 움직이지 않습니다.
+     * 3. W/A/S/D 중 하나를 누른 상태에서 좌클릭/우클릭을 교대로 눌러야 이동합니다.
+     * 4. 벽을 좌클릭으로 잡았다면 다음 이동 입력은 우클릭부터 시작합니다.
+     * 5. 인정된 좌클릭과 우클릭 사이에는 최소 0.5초 간격이 필요합니다.
+     * 6. 올바른 입력 1회당 해당 방향으로 9f 이동합니다.
+     * 7. 실제 이동 성공 1회당 스테미너 0.05f를 소모합니다.
+     * 8. 벽에 가만히 매달려 있을 때 PEAK 원본의 지속 스테미너 소모를 차단합니다.
+     * 9. 이동 중에는 PEAK 원본 WASD 등반 애니메이션을 사용합니다.
+     * 10. 이동이 끝나면 현재 손을 뻗은 애니메이션 프레임에서 멈춥니다.
+     * 11. 다음 이동이 시작되면 멈춘 프레임부터 애니메이션을 이어서 재생합니다.
+     *
+     * Reflection은 사용하지 않습니다.
+     */
+    internal static class NoWall
+    {
+        private const float StepDistance = 9f;
+        private const float StepStaminaCost = 0.05f;
+        private const float MouseAlternationDelay = 0.5f;
+        private const float NormalGrabDetectionWindow = 0.75f;
+
+        private const float MinimumDirectionSqrMagnitude = 0.0001f;
+        private const float BodyMovementSqrMagnitude = 0.000025f;
+        private const float ClimbTargetChangeSqrMagnitude = 0.000001f;
+
+        private const float MinimumStepAnimationTime = 0.15f;
+        private const float MovementStopGraceTime = 0.08f;
+        private const float MinimumAnimationSpeed = 0.01f;
+
+        private static readonly int ClimbJumpAnimationHash =
+            Animator.StringToHash("Climb Jump");
+
+        private static readonly int InputXAnimationHash =
+            Animator.StringToHash("Input X");
+
+        private static readonly int InputYAnimationHash =
+            Animator.StringToHash("Input Y");
+
+        private static readonly Dictionary<int, ClimbState> States =
+            new Dictionary<int, ClimbState>();
+
+        /*
+         * StartClimbRpc 내부에서 발생하는 원본 부착 스테미너 소모를
+         * 잠시 차단하기 위한 캐릭터 ID 집합입니다.
+         */
+        private static readonly HashSet<int> StartingClimbCharacters =
+            new HashSet<int>();
+
+        private enum ExpectedHand
+        {
+            Left,
+            Right
+        }
+
+        private enum StepDirection
+        {
+            Up,
+            Down,
+            Left,
+            Right
+        }
+
+        private sealed class ClimbState
+        {
+            public bool WasNormalWallClimbing;
+
+            public ExpectedHand NextHand =
+                ExpectedHand.Left;
+
+            public float LastPrimaryPressedTime =
+                float.NegativeInfinity;
+
+            public float LastAcceptedClickTime =
+                float.NegativeInfinity;
+
+            public bool HasAcceptedClick;
+
+            public int LastProcessedInputFrame =
+                -1;
+
+            public bool HasAnimationPose;
+            public bool StepActive;
+            public bool AnimatorFrozen;
+            public bool HasPositionSample;
+
+            public float StepStartedTime;
+            public float TimeWithoutMovement;
+
+            public Vector2 LastAnimationDirection =
+                Vector2.zero;
+
+            public Vector3 LastClimbPosition =
+                Vector3.zero;
+
+            public Vector3 LastCharacterCenter =
+                Vector3.zero;
+        }
+
+        private static Character ResolveCharacter(
+            Component component)
+        {
+            if (component == null)
+            {
+                return null;
+            }
+
+            Character character =
+                component.GetComponent<Character>();
+
+            if (character == null)
+            {
+                character =
+                    component.GetComponentInParent<Character>();
+            }
+
+            return character;
+        }
+
+        private static ClimbState GetOrCreateState(
+            Character character)
+        {
+            int characterId =
+                character.GetInstanceID();
+
+            ClimbState state;
+
+            if (!States.TryGetValue(
+                    characterId,
+                    out state))
+            {
+                state =
+                    new ClimbState();
+
+                States.Add(
+                    characterId,
+                    state);
+            }
+
+            return state;
+        }
+
+        private static bool IsNormalWallClimbing(
+            Character character)
+        {
+            if (character == null ||
+                character.data == null ||
+                character.refs == null ||
+                character.refs.climbing == null)
+            {
+                return false;
+            }
+
+            return
+                character.data.isClimbing &&
+                !character.data.isRopeClimbing &&
+                !character.data.isVineClimbing &&
+                character.data.currentClimbHandle == null;
+        }
+
+        private static bool IsLocalNormalWallClimbing(
+            Character character)
+        {
+            return
+                character != null &&
+                character.IsLocal &&
+                IsNormalWallClimbing(character);
+        }
+
+        private static bool ReadUpHeld(
+            Vector2 fallbackMovement)
+        {
+            if (CharacterInput.action_moveForward != null)
+            {
+                return
+                    CharacterInput.action_moveForward.IsPressed();
+            }
+
+            return
+                fallbackMovement.y > 0.5f;
+        }
+
+        private static bool ReadDownHeld(
+            Vector2 fallbackMovement)
+        {
+            if (CharacterInput.action_moveBackward != null)
+            {
+                return
+                    CharacterInput.action_moveBackward.IsPressed();
+            }
+
+            return
+                fallbackMovement.y < -0.5f;
+        }
+
+        private static bool ReadLeftHeld(
+            Vector2 fallbackMovement)
+        {
+            if (CharacterInput.action_moveLeft != null)
+            {
+                return
+                    CharacterInput.action_moveLeft.IsPressed();
+            }
+
+            return
+                fallbackMovement.x < -0.5f;
+        }
+
+        private static bool ReadRightHeld(
+            Vector2 fallbackMovement)
+        {
+            if (CharacterInput.action_moveRight != null)
+            {
+                return
+                    CharacterInput.action_moveRight.IsPressed();
+            }
+
+            return
+                fallbackMovement.x > 0.5f;
+        }
+
+        private static bool ReadPrimaryPressed(
+            CharacterInput characterInput)
+        {
+            if (CharacterInput.action_usePrimary != null)
+            {
+                return
+                    CharacterInput.action_usePrimary
+                        .WasPressedThisFrame();
+            }
+
+            return
+                characterInput != null &&
+                characterInput.usePrimaryWasPressed;
+        }
+
+        private static bool ReadSecondaryPressed(
+            CharacterInput characterInput)
+        {
+            if (CharacterInput.action_useSecondary != null)
+            {
+                return
+                    CharacterInput.action_useSecondary
+                        .WasPressedThisFrame();
+            }
+
+            return
+                characterInput != null &&
+                characterInput.useSecondaryWasPressed;
+        }
+
+        private static bool ReadPrimaryHeld(
+            CharacterInput characterInput)
+        {
+            if (CharacterInput.action_usePrimary != null)
+            {
+                return
+                    CharacterInput.action_usePrimary.IsPressed();
+            }
+
+            return
+                characterInput != null &&
+                characterInput.usePrimaryIsPressed;
+        }
+
+        private static bool TryGetSingleHeldDirection(
+            Vector2 fallbackMovement,
+            out StepDirection stepDirection,
+            out Vector2 animationDirection)
+        {
+            bool upHeld =
+                ReadUpHeld(
+                    fallbackMovement);
+
+            bool downHeld =
+                ReadDownHeld(
+                    fallbackMovement);
+
+            bool leftHeld =
+                ReadLeftHeld(
+                    fallbackMovement);
+
+            bool rightHeld =
+                ReadRightHeld(
+                    fallbackMovement);
+
+            int directionCount =
+                0;
+
+            stepDirection =
+                StepDirection.Up;
+
+            animationDirection =
+                Vector2.zero;
+
+            if (upHeld)
+            {
+                directionCount++;
+                stepDirection =
+                    StepDirection.Up;
+
+                animationDirection =
+                    Vector2.up;
+            }
+
+            if (downHeld)
+            {
+                directionCount++;
+                stepDirection =
+                    StepDirection.Down;
+
+                animationDirection =
+                    Vector2.down;
+            }
+
+            if (leftHeld)
+            {
+                directionCount++;
+                stepDirection =
+                    StepDirection.Left;
+
+                animationDirection =
+                    Vector2.left;
+            }
+
+            if (rightHeld)
+            {
+                directionCount++;
+                stepDirection =
+                    StepDirection.Right;
+
+                animationDirection =
+                    Vector2.right;
+            }
+
+            /*
+             * 방향키가 없거나 둘 이상 동시에 눌린 경우
+             * 이동 방향을 확정하지 않습니다.
+             */
+            return
+                directionCount == 1;
+        }
+
+        private static bool TryGetWallAxes(
+            Character character,
+            out Vector3 wallUp,
+            out Vector3 wallRight)
+        {
+            wallUp =
+                Vector3.zero;
+
+            wallRight =
+                Vector3.zero;
+
+            if (character == null ||
+                character.data == null)
+            {
+                return false;
+            }
+
+            Vector3 wallNormal =
+                character.data.climbNormal;
+
+            if (wallNormal.sqrMagnitude <=
+                MinimumDirectionSqrMagnitude)
+            {
+                return false;
+            }
+
+            wallNormal.Normalize();
+
+            wallUp =
+                Vector3.ProjectOnPlane(
+                    Vector3.up,
+                    wallNormal);
+
+            if (wallUp.sqrMagnitude <=
+                MinimumDirectionSqrMagnitude)
+            {
+                return false;
+            }
+
+            wallUp.Normalize();
+
+            wallRight =
+                Vector3.Cross(
+                    wallNormal,
+                    wallUp);
+
+            if (wallRight.sqrMagnitude <=
+                MinimumDirectionSqrMagnitude)
+            {
+                return false;
+            }
+
+            wallRight.Normalize();
+
+            return true;
+        }
+
+        private static bool TryBuildStepVector(
+            Character character,
+            StepDirection direction,
+            out Vector3 stepVector)
+        {
+            stepVector =
+                Vector3.zero;
+
+            Vector3 wallUp;
+            Vector3 wallRight;
+
+            if (!TryGetWallAxes(
+                    character,
+                    out wallUp,
+                    out wallRight))
+            {
+                return false;
+            }
+
+            switch (direction)
+            {
+                case StepDirection.Up:
+                    stepVector =
+                        wallUp *
+                        StepDistance;
+                    break;
+
+                case StepDirection.Down:
+                    stepVector =
+                        -wallUp *
+                        StepDistance;
+                    break;
+
+                case StepDirection.Left:
+                    stepVector =
+                        -wallRight *
+                        StepDistance;
+                    break;
+
+                case StepDirection.Right:
+                    stepVector =
+                        wallRight *
+                        StepDistance;
+                    break;
+            }
+
+            return
+                stepVector.sqrMagnitude >
+                MinimumDirectionSqrMagnitude;
+        }
+
+        private static bool HasEnoughStamina(
+            Character character)
+        {
+            if (character == null ||
+                character.data == null)
+            {
+                return false;
+            }
+
+            float totalStamina =
+                Mathf.Max(
+                    0f,
+                    character.data.currentStamina) +
+                Mathf.Max(
+                    0f,
+                    character.data.extraStamina);
+
+            return
+                totalStamina + 0.0001f >=
+                StepStaminaCost;
+        }
+
+        private static bool ConsumeStepStamina(
+            Character character)
+        {
+            if (!HasEnoughStamina(character))
+            {
+                return false;
+            }
+
+            float remainingCost =
+                StepStaminaCost;
+
+            float regularStaminaUsed =
+                Mathf.Min(
+                    Mathf.Max(
+                        0f,
+                        character.data.currentStamina),
+                    remainingCost);
+
+            character.data.currentStamina -=
+                regularStaminaUsed;
+
+            remainingCost -=
+                regularStaminaUsed;
+
+            if (remainingCost > 0f)
+            {
+                float bonusStaminaUsed =
+                    Mathf.Min(
+                        Mathf.Max(
+                            0f,
+                            character.data.extraStamina),
+                        remainingCost);
+
+                character.data.extraStamina -=
+                    bonusStaminaUsed;
+
+                remainingCost -=
+                    bonusStaminaUsed;
+            }
+
+            character.ClampStamina();
+
+            character.data.extraStamina =
+                Mathf.Max(
+                    0f,
+                    character.data.extraStamina);
+
+            character.data.sinceUseStamina =
+                0f;
+
+            if (GUIManager.instance != null &&
+                GUIManager.instance.bar != null)
+            {
+                GUIManager.instance.bar.ChangeBar();
+            }
+
+            return
+                remainingCost <= 0.0001f;
+        }
+
+        private static bool CanAcceptClick(
+            ClimbState state,
+            ExpectedHand pressedHand)
+        {
+            if (state == null ||
+                state.StepActive)
+            {
+                return false;
+            }
+
+            if (pressedHand !=
+                state.NextHand)
+            {
+                return false;
+            }
+
+            if (!state.HasAcceptedClick)
+            {
+                return true;
+            }
+
+            float elapsed =
+                Time.unscaledTime -
+                state.LastAcceptedClickTime;
+
+            return
+                elapsed >=
+                MouseAlternationDelay;
+        }
+
+        private static void RegisterAcceptedClick(
+            ClimbState state,
+            ExpectedHand pressedHand)
+        {
+            state.HasAcceptedClick =
+                true;
+
+            state.LastAcceptedClickTime =
+                Time.unscaledTime;
+
+            state.NextHand =
+                pressedHand ==
+                ExpectedHand.Left
+                    ? ExpectedHand.Right
+                    : ExpectedHand.Left;
+        }
+
+        private static bool TryApplyStep(
+            Character character,
+            ClimbState state,
+            StepDirection stepDirection,
+            Vector2 animationDirection)
+        {
+            if (!IsLocalNormalWallClimbing(
+                    character) ||
+                state == null ||
+                state.StepActive)
+            {
+                return false;
+            }
+
+            Vector3 stepVector;
+
+            if (!TryBuildStepVector(
+                    character,
+                    stepDirection,
+                    out stepVector))
+            {
+                return false;
+            }
+
+            /*
+             * 스테미너가 부족하면 이동과 손 교대를 모두 실행하지 않습니다.
+             */
+            if (!ConsumeStepStamina(
+                    character))
+            {
+                return false;
+            }
+
+            character.refs.climbing.playerSlide =
+                Vector2.zero;
+
+            character.data.climbPos +=
+                stepVector;
+
+            character.data.sinceGrounded =
+                0f;
+
+            state.LastAnimationDirection =
+                animationDirection;
+
+            state.HasAnimationPose =
+                true;
+
+            state.StepActive =
+                true;
+
+            state.AnimatorFrozen =
+                false;
+
+            state.StepStartedTime =
+                Time.unscaledTime;
+
+            state.TimeWithoutMovement =
+                0f;
+
+            return true;
+        }
+
+        private static void InitializeClimbState(
+            Character character,
+            ClimbState state)
+        {
+            if (character == null ||
+                state == null)
+            {
+                return;
+            }
+
+            bool startedByNormalLeftClick =
+                Time.unscaledTime -
+                state.LastPrimaryPressedTime <=
+                NormalGrabDetectionWindow;
+
+            /*
+             * CharacterInput.Sample보다 StartClimbRpc가 먼저 실행된 특수 상황에서도
+             * 현재 좌클릭 유지 상태를 벽잡기 입력으로 인정합니다.
+             */
+            if (!startedByNormalLeftClick &&
+                character.input != null &&
+                ReadPrimaryHeld(
+                    character.input))
+            {
+                startedByNormalLeftClick =
+                    true;
+
+                state.LastPrimaryPressedTime =
+                    Time.unscaledTime;
+            }
+
+            if (startedByNormalLeftClick)
+            {
+                state.NextHand =
+                    ExpectedHand.Right;
+
+                state.HasAcceptedClick =
+                    true;
+
+                state.LastAcceptedClickTime =
+                    state.LastPrimaryPressedTime;
+            }
+            else
+            {
+                state.NextHand =
+                    ExpectedHand.Left;
+
+                state.HasAcceptedClick =
+                    false;
+
+                state.LastAcceptedClickTime =
+                    float.NegativeInfinity;
+            }
+
+            state.WasNormalWallClimbing =
+                true;
+
+            state.LastProcessedInputFrame =
+                -1;
+
+            state.HasAnimationPose =
+                false;
+
+            state.StepActive =
+                false;
+
+            state.AnimatorFrozen =
+                false;
+
+            state.StepStartedTime =
+                0f;
+
+            state.TimeWithoutMovement =
+                0f;
+
+            state.LastAnimationDirection =
+                Vector2.zero;
+
+            state.HasPositionSample =
+                true;
+
+            state.LastClimbPosition =
+                character.data.climbPos;
+
+            state.LastCharacterCenter =
+                character.Center;
+
+            if (character.refs != null &&
+                character.refs.climbing != null)
+            {
+                character.refs.climbing.playerSlide =
+                    Vector2.zero;
+            }
+
+            if (character.refs != null &&
+                character.refs.animator != null)
+            {
+                character.refs.animator.speed =
+                    1f;
+            }
+        }
+
+        private static void RestoreAnimatorAndResetClimbState(
+            Character character,
+            ClimbState state)
+        {
+            if (state == null)
+            {
+                return;
+            }
+
+            if (character != null &&
+                character.refs != null &&
+                character.refs.animator != null)
+            {
+                character.refs.animator.speed =
+                    1f;
+            }
+
+            state.WasNormalWallClimbing =
+                false;
+
+            state.NextHand =
+                ExpectedHand.Left;
+
+            state.HasAcceptedClick =
+                false;
+
+            state.LastAcceptedClickTime =
+                float.NegativeInfinity;
+
+            state.LastProcessedInputFrame =
+                -1;
+
+            state.HasAnimationPose =
+                false;
+
+            state.StepActive =
+                false;
+
+            state.AnimatorFrozen =
+                false;
+
+            state.HasPositionSample =
+                false;
+
+            state.StepStartedTime =
+                0f;
+
+            state.TimeWithoutMovement =
+                0f;
+
+            state.LastAnimationDirection =
+                Vector2.zero;
+
+            state.LastClimbPosition =
+                Vector3.zero;
+
+            state.LastCharacterCenter =
+                Vector3.zero;
+        }
+
+        private static void BlockOriginalWallMovement(
+            CharacterInput characterInput)
+        {
+            if (characterInput == null)
+            {
+                return;
+            }
+
+            /*
+             * PEAK 원본의 연속 WASD 등반과 Shift 등반 점프를 차단합니다.
+             */
+            characterInput.movementInput =
+                Vector2.zero;
+
+            characterInput.sprintWasPressed =
+                false;
+
+            characterInput.sprintIsPressed =
+                false;
+
+            characterInput.sprintToggleWasPressed =
+                false;
+
+            characterInput.sprintToggleIsPressed =
+                false;
+
+            /*
+             * 좌클릭을 놓아도 벽에서 자동으로 떨어지지 않게 합니다.
+             * 벽에서 떨어지는 원본 점프 입력은 건드리지 않습니다.
+             */
+            characterInput.usePrimaryWasReleased =
+                false;
+
+            /*
+             * 입력은 NoWall이 이미 직접 읽었으므로
+             * 뒤에 실행되는 기존 RealControl 등의 중복 처리를 막습니다.
+             */
+            characterInput.usePrimaryWasPressed =
+                false;
+
+            characterInput.usePrimaryIsPressed =
+                false;
+
+            characterInput.useSecondaryWasPressed =
+                false;
+
+            characterInput.useSecondaryIsPressed =
+                false;
+
+            characterInput.useSecondaryWasReleased =
+                false;
+        }
+
+        private static void ProcessLocalClimbInput(
+            CharacterInput characterInput,
+            Character character,
+            ClimbState state,
+            Vector2 sampledMovement)
+        {
+            if (state.LastProcessedInputFrame ==
+                Time.frameCount)
+            {
+                BlockOriginalWallMovement(
+                    characterInput);
+
+                return;
+            }
+
+            state.LastProcessedInputFrame =
+                Time.frameCount;
+
+            bool primaryPressed =
+                ReadPrimaryPressed(
+                    characterInput);
+
+            bool secondaryPressed =
+                ReadSecondaryPressed(
+                    characterInput);
+
+            /*
+             * 같은 프레임에 좌우 버튼이 모두 눌리면
+             * 어느 손도 인정하지 않습니다.
+             */
+            if (primaryPressed !=
+                secondaryPressed)
+            {
+                ExpectedHand pressedHand =
+                    primaryPressed
+                        ? ExpectedHand.Left
+                        : ExpectedHand.Right;
+
+                StepDirection stepDirection;
+                Vector2 animationDirection;
+
+                if (CanAcceptClick(
+                        state,
+                        pressedHand) &&
+                    TryGetSingleHeldDirection(
+                        sampledMovement,
+                        out stepDirection,
+                        out animationDirection) &&
+                    TryApplyStep(
+                        character,
+                        state,
+                        stepDirection,
+                        animationDirection))
+                {
+                    RegisterAcceptedClick(
+                        state,
+                        pressedHand);
+                }
+            }
+
+            BlockOriginalWallMovement(
+                characterInput);
+        }
+
+        private static Vector3 GetWallSurfaceMovement(
+            Character character,
+            Vector3 worldMovement)
+        {
+            Vector3 wallUp;
+            Vector3 wallRight;
+
+            if (!TryGetWallAxes(
+                    character,
+                    out wallUp,
+                    out wallRight))
+            {
+                return
+                    Vector3.zero;
+            }
+
+            return
+                wallRight *
+                Vector3.Dot(
+                    worldMovement,
+                    wallRight) +
+                wallUp *
+                Vector3.Dot(
+                    worldMovement,
+                    wallUp);
+        }
+
+        private static bool TryConvertWorldMovementToAnimationDirection(
+            Character character,
+            Vector3 worldMovement,
+            out Vector2 animationDirection)
+        {
+            animationDirection =
+                Vector2.zero;
+
+            Vector3 wallUp;
+            Vector3 wallRight;
+
+            if (!TryGetWallAxes(
+                    character,
+                    out wallUp,
+                    out wallRight))
+            {
+                return false;
+            }
+
+            animationDirection =
+                new Vector2(
+                    Vector3.Dot(
+                        worldMovement,
+                        wallRight),
+                    Vector3.Dot(
+                        worldMovement,
+                        wallUp));
+
+            if (animationDirection.sqrMagnitude <=
+                MinimumDirectionSqrMagnitude)
+            {
+                animationDirection =
+                    Vector2.zero;
+
+                return false;
+            }
+
+            animationDirection.Normalize();
+
+            return true;
+        }
+
+        private static void ApplyAnimationDirection(
+            Animator animator,
+            Vector2 direction)
+        {
+            animator.SetFloat(
+                InputXAnimationHash,
+                direction.x);
+
+            animator.SetFloat(
+                InputYAnimationHash,
+                direction.y);
+        }
+
+        private static float GetClimbAnimationSpeed(
+            Character character)
+        {
+            if (character == null ||
+                character.data == null)
+            {
+                return
+                    1f;
+            }
+
+            return
+                Mathf.Max(
+                    MinimumAnimationSpeed,
+                    character.data.staminaMod);
+        }
+
+        private static void ResumeClimbAnimation(
+            Character character,
+            ClimbState state)
+        {
+            Animator animator =
+                character.refs.animator;
+
+            animator.SetBool(
+                ClimbJumpAnimationHash,
+                false);
+
+            ApplyAnimationDirection(
+                animator,
+                state.LastAnimationDirection);
+
+            /*
+             * Animator.Play를 호출하지 않고 speed만 복구합니다.
+             * 따라서 이전에 정지했던 normalized time부터 그대로 이어집니다.
+             */
+            animator.speed =
+                GetClimbAnimationSpeed(
+                    character);
+
+            state.AnimatorFrozen =
+                false;
+        }
+
+        private static void FreezeClimbAnimation(
+            Character character,
+            ClimbState state)
+        {
+            Animator animator =
+                character.refs.animator;
+
+            animator.SetBool(
+                ClimbJumpAnimationHash,
+                false);
+
+            ApplyAnimationDirection(
+                animator,
+                state.LastAnimationDirection);
+
+            /*
+             * 손을 뻗고 있는 현재 애니메이션 프레임을 그대로 고정합니다.
+             */
+            animator.speed =
+                0f;
+
+            state.AnimatorFrozen =
+                true;
+
+            state.StepActive =
+                false;
+        }
+
+        private static void UpdateAnimationFlow(
+            Character character,
+            ClimbState state)
+        {
+            if (character == null ||
+                state == null ||
+                character.refs == null ||
+                character.refs.animator == null)
+            {
+                return;
+            }
+
+            Vector3 currentClimbPosition =
+                character.data.climbPos;
+
+            Vector3 currentCharacterCenter =
+                character.Center;
+
+            if (!state.HasPositionSample)
+            {
+                state.HasPositionSample =
+                    true;
+
+                state.LastClimbPosition =
+                    currentClimbPosition;
+
+                state.LastCharacterCenter =
+                    currentCharacterCenter;
+
+                return;
+            }
+
+            Vector3 climbTargetMovement =
+                currentClimbPosition -
+                state.LastClimbPosition;
+
+            Vector3 bodyMovement =
+                currentCharacterCenter -
+                state.LastCharacterCenter;
+
+            Vector3 surfaceBodyMovement =
+                GetWallSurfaceMovement(
+                    character,
+                    bodyMovement);
+
+            bool climbTargetChanged =
+                climbTargetMovement.sqrMagnitude >
+                ClimbTargetChangeSqrMagnitude;
+
+            bool bodyIsMoving =
+                surfaceBodyMovement.sqrMagnitude >
+                BodyMovementSqrMagnitude;
+
+            /*
+             * 원격 플레이어는 로컬 입력 상태가 없으므로
+             * 네트워크로 전달된 climbPos 변화에서 방향을 복원합니다.
+             */
+            if (climbTargetChanged)
+            {
+                Vector2 detectedDirection;
+
+                if (TryConvertWorldMovementToAnimationDirection(
+                        character,
+                        climbTargetMovement,
+                        out detectedDirection))
+                {
+                    state.LastAnimationDirection =
+                        detectedDirection;
+
+                    state.HasAnimationPose =
+                        true;
+
+                    state.StepActive =
+                        true;
+
+                    state.StepStartedTime =
+                        Time.unscaledTime;
+
+                    state.TimeWithoutMovement =
+                        0f;
+                }
+            }
+
+            if (state.StepActive &&
+                state.HasAnimationPose)
+            {
+                float stepElapsed =
+                    Time.unscaledTime -
+                    state.StepStartedTime;
+
+                if (climbTargetChanged ||
+                    bodyIsMoving ||
+                    stepElapsed <
+                    MinimumStepAnimationTime)
+                {
+                    state.TimeWithoutMovement =
+                        0f;
+
+                    ResumeClimbAnimation(
+                        character,
+                        state);
+                }
+                else
+                {
+                    state.TimeWithoutMovement +=
+                        Time.unscaledDeltaTime;
+
+                    if (state.TimeWithoutMovement >=
+                        MovementStopGraceTime)
+                    {
+                        FreezeClimbAnimation(
+                            character,
+                            state);
+                    }
+                    else
+                    {
+                        ResumeClimbAnimation(
+                            character,
+                            state);
+                    }
+                }
+            }
+            else if (state.HasAnimationPose)
+            {
+                /*
+                 * 이동이 끝난 뒤에도 원본 CharacterAnimations.Update가
+                 * Input X/Y와 speed를 되돌리지 못하도록 매 프레임 유지합니다.
+                 */
+                FreezeClimbAnimation(
+                    character,
+                    state);
+            }
+            else
+            {
+                /*
+                 * 아직 첫 스텝을 실행하지 않은 최초 벽잡기 자세는
+                 * PEAK 원본 애니메이션에 맡깁니다.
+                 */
+                character.refs.animator.SetBool(
+                    ClimbJumpAnimationHash,
+                    false);
+            }
+
+            state.LastClimbPosition =
+                currentClimbPosition;
+
+            state.LastCharacterCenter =
+                currentCharacterCenter;
+        }
+
+        /*
+         * PEAK가 입력을 샘플링한 직후 실행됩니다.
+         *
+         * CharacterInput의 public static InputAction을 직접 읽기 때문에
+         * 다른 패치가 movementInput 또는 클릭 필드를 지워도
+         * 실제 W/A/S/D 및 좌우클릭 입력을 확인할 수 있습니다.
+         */
+        [HarmonyPatch(
+            typeof(CharacterInput),
+            "Sample",
+            new Type[]
+            {
+                typeof(bool)
+            })]
+        private static class CharacterInputSamplePatch
+        {
+            [HarmonyPostfix]
+            [HarmonyPriority(Priority.First)]
+            private static void Postfix(
+                CharacterInput __instance)
+            {
+                if (__instance == null)
+                {
+                    return;
+                }
+
+                Character character =
+                    ResolveCharacter(
+                        __instance);
+
+                if (character == null ||
+                    !character.IsLocal)
+                {
+                    return;
+                }
+
+                ClimbState state =
+                    GetOrCreateState(
+                        character);
+
+                Vector2 sampledMovement =
+                    __instance.movementInput;
+
+                bool primaryPressed =
+                    ReadPrimaryPressed(
+                        __instance);
+
+                if (!IsLocalNormalWallClimbing(
+                        character))
+                {
+                    if (primaryPressed)
+                    {
+                        state.LastPrimaryPressedTime =
+                            Time.unscaledTime;
+                    }
+
+                    if (state.WasNormalWallClimbing)
+                    {
+                        RestoreAnimatorAndResetClimbState(
+                            character,
+                            state);
+                    }
+
+                    /*
+                     * 지상 이동과 일반 아이템 사용 입력은 전혀 건드리지 않습니다.
+                     */
+                    return;
+                }
+
+                if (!state.WasNormalWallClimbing)
+                {
+                    InitializeClimbState(
+                        character,
+                        state);
+                }
+
+                ProcessLocalClimbInput(
+                    __instance,
+                    character,
+                    state,
+                    sampledMovement);
+            }
+        }
+
+        /*
+         * CharacterClimbing.Update가 Sample보다 먼저 실행되는 프레임에도
+         * 원본 연속 이동 및 Shift 등반 점프가 실행되지 않도록 방어합니다.
+         */
+        [HarmonyPatch(
+            typeof(CharacterClimbing),
+            "Update")]
+        private static class CharacterClimbingUpdatePatch
+        {
+            [HarmonyPrefix]
+            [HarmonyPriority(Priority.First)]
+            private static void Prefix(
+                CharacterClimbing __instance)
+            {
+                Character character =
+                    ResolveCharacter(
+                        __instance);
+
+                if (!IsLocalNormalWallClimbing(
+                        character))
+                {
+                    return;
+                }
+
+                BlockOriginalWallMovement(
+                    character.input);
+            }
+        }
+
+        /*
+         * 새 벽을 잡는 동안 PEAK 원본 StartClimbRpc에서 발생하는
+         * 재부착 스테미너 소모를 차단합니다.
+         */
+        [HarmonyPatch(
+            typeof(CharacterClimbing),
+            "StartClimbRpc",
+            new Type[]
+            {
+                typeof(Vector3),
+                typeof(Vector3)
+            })]
+        private static class StartClimbRpcPatch
+        {
+            [HarmonyPrefix]
+            [HarmonyPriority(Priority.First)]
+            private static void Prefix(
+                CharacterClimbing __instance)
+            {
+                Character character =
+                    ResolveCharacter(
+                        __instance);
+
+                if (character == null ||
+                    !character.IsLocal)
+                {
+                    return;
+                }
+
+                StartingClimbCharacters.Add(
+                    character.GetInstanceID());
+            }
+
+            [HarmonyPostfix]
+            [HarmonyPriority(Priority.Last)]
+            private static void Postfix(
+                CharacterClimbing __instance)
+            {
+                Character character =
+                    ResolveCharacter(
+                        __instance);
+
+                if (character == null)
+                {
+                    return;
+                }
+
+                StartingClimbCharacters.Remove(
+                    character.GetInstanceID());
+
+                ClimbState state =
+                    GetOrCreateState(
+                        character);
+
+                if (character.IsLocal &&
+                    IsNormalWallClimbing(
+                        character))
+                {
+                    InitializeClimbState(
+                        character,
+                        state);
+                }
+                else
+                {
+                    RestoreAnimatorAndResetClimbState(
+                        character,
+                        state);
+                }
+            }
+        }
+
+        /*
+         * 벽을 잡고 있는 동안 PEAK 원본의 매 프레임 스테미너 소비를
+         * 성공 처리만 하고 실제 수치는 차감하지 않습니다.
+         *
+         * NoWall의 스텝 0.05f 비용은 Character.UseStamina를 호출하지 않고
+         * ConsumeStepStamina에서 직접 처리하므로 이 패치에 차단되지 않습니다.
+         */
+        [HarmonyPatch(
+            typeof(Character),
+            "UseStamina",
+            new Type[]
+            {
+                typeof(float),
+                typeof(bool)
+            })]
+        private static class CharacterUseStaminaPatch
+        {
+            [HarmonyPrefix]
+            [HarmonyPriority(Priority.First)]
+            private static bool Prefix(
+                Character __instance,
+                float __0,
+                ref bool __result)
+            {
+                if (__instance == null ||
+                    !__instance.IsLocal ||
+                    __instance.data == null ||
+                    __0 <= 0f)
+                {
+                    return true;
+                }
+
+                int characterId =
+                    __instance.GetInstanceID();
+
+                bool suppressStartingClimbCost =
+                    StartingClimbCharacters.Contains(
+                        characterId);
+
+                bool suppressWallHoldingCost =
+                    IsNormalWallClimbing(
+                        __instance);
+
+                if (!suppressStartingClimbCost &&
+                    !suppressWallHoldingCost)
+                {
+                    return true;
+                }
+
+                /*
+                 * 벽에 붙어 있는 동안 자동 회복이 동시에 진행되지 않게
+                 * 원본 사용 중 상태만 유지합니다.
+                 */
+                __instance.data.sinceUseStamina =
+                    0f;
+
+                __result =
+                    true;
+
+                return false;
+            }
+        }
+
+        /*
+         * PEAK 원본 CharacterAnimations.Update가 Input X/Y와 speed를
+         * 갱신한 뒤 가장 마지막에 NoWall의 애니메이션 상태를 적용합니다.
+         */
+        [HarmonyPatch(
+            typeof(CharacterAnimations),
+            "Update")]
+        private static class CharacterAnimationsUpdatePatch
+        {
+            [HarmonyPostfix]
+            [HarmonyPriority(-200)]
+            private static void Postfix(
+                CharacterAnimations __instance)
+            {
+                Character character =
+                    ResolveCharacter(
+                        __instance);
+
+                if (character == null)
+                {
+                    return;
+                }
+
+                ClimbState state =
+                    GetOrCreateState(
+                        character);
+
+                if (!IsNormalWallClimbing(
+                        character))
+                {
+                    if (state.WasNormalWallClimbing ||
+                        state.HasAnimationPose ||
+                        state.AnimatorFrozen)
+                    {
+                        RestoreAnimatorAndResetClimbState(
+                            character,
+                            state);
+                    }
+
+                    return;
+                }
+
+                state.WasNormalWallClimbing =
+                    true;
+
+                UpdateAnimationFlow(
+                    character,
+                    state);
+            }
+        }
+
+        [HarmonyPatch(
+            typeof(CharacterClimbing),
+            nameof(CharacterClimbing.StopClimbingRpc),
+            new Type[]
+            {
+                typeof(float)
+            })]
+        private static class StopClimbingRpcPatch
+        {
+            [HarmonyPostfix]
+            [HarmonyPriority(-200)]
+            private static void Postfix(
+                CharacterClimbing __instance)
+            {
+                Character character =
+                    ResolveCharacter(
+                        __instance);
+
+                if (character == null)
+                {
+                    return;
+                }
+
+                ClimbState state =
+                    GetOrCreateState(
+                        character);
+
+                RestoreAnimatorAndResetClimbState(
+                    character,
+                    state);
+
+                __instance.playerSlide =
+                    Vector2.zero;
+            }
+        }
+
+        /*
+         * 캐릭터 오브젝트가 파괴될 때 정적 캐시를 정리합니다.
+         */
+        [HarmonyPatch(
+            typeof(Character),
+            "OnDestroy")]
+        private static class CharacterOnDestroyPatch
+        {
+            [HarmonyPostfix]
+            private static void Postfix(
+                Character __instance)
+            {
+                if (__instance == null)
+                {
+                    return;
+                }
+
+                int characterId =
+                    __instance.GetInstanceID();
+
+                States.Remove(
+                    characterId);
+
+                StartingClimbCharacters.Remove(
+                    characterId);
+            }
+        }
+    }
+}
