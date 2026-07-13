@@ -64,19 +64,19 @@ public sealed class RealControlPlugin : BaseUnityPlugin
         upStepDistance = Config.Bind(
             "Climb Step",
             "UpStepDistance",
-            0.45f,
+            1.5f,
             "W를 누른 상태에서 올바른 좌클릭/우클릭 교대 입력 1회당 위로 이동할 거리입니다.");
 
         sideStepDistance = Config.Bind(
             "Climb Step",
             "SideStepDistance",
-            0.45f,
+            1.5f,
             "A 또는 D를 누른 상태에서 올바른 좌클릭/우클릭 교대 입력 1회당 좌우로 이동할 거리입니다.");
 
         downStepDistance = Config.Bind(
             "Climb Step",
             "DownStepDistance",
-            0.45f,
+            1.5f,
             "S를 누른 상태에서 올바른 좌클릭/우클릭 교대 입력 1회당 아래로 이동할 거리입니다.");
 
         logSuccessfulSteps = Config.Bind(
