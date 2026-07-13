@@ -1,25 +1,31 @@
 using HarmonyLib;
 using Photon.Pun;
+using System;
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace Sapphire009.RealControlMod
 {
     /*
-     * 이 클래스는 일반 벽 등반에 아래 두 기능만 적용합니다.
+     * 일반 벽 등반 전용 기능입니다.
      *
-     * 1. 일반 벽을 잡은 상태에서는 스페이스바를 눌러도 손을 놓지 않습니다.
-     * 2. 일반 스테미나와 보너스 스테미나가 모두 0이 되면
-     *    아래로 미끄러지지 않고 즉시 벽에서 손을 놓습니다.
+     * 1. 일반 벽을 잡은 상태에서는 스페이스바로 손을 놓지 않습니다.
+     * 2. 일반 + 보너스 스테미나 합계가 4.9% 이하가 되면 즉시 손을 놓습니다.
+     * 3. 강제 해제 후 스테미나가 회복되고 좌클릭을 놓기 전까지
+     *    같은 벽을 즉시 다시 잡지 못하게 합니다.
      *
-     * 로프, 덩굴, 클라임 핸들에는 적용하지 않습니다.
+     * 로프, 덩굴, 클라임 핸들은 수정하지 않습니다.
      * Reflection은 사용하지 않습니다.
      */
     internal static class NoWall
     {
-        private const float StaminaZeroThreshold = 0.0001f;
+        private const float ReleaseStaminaThreshold = 0.049f;
+        private const float ComparisonEpsilon = 0.0005f;
 
-        private static Character ResolveCharacter(
-            Component component)
+        private static readonly HashSet<int> ForcedReleaseLocks =
+            new HashSet<int>();
+
+        private static Character ResolveCharacter(Component component)
         {
             if (component == null)
             {
@@ -38,40 +44,127 @@ namespace Sapphire009.RealControlMod
             return character;
         }
 
-        private static bool IsLocalNormalWallClimbing(
-            Character character)
+        private static bool IsLocalCharacter(Character character)
         {
-            if (character == null ||
-                !character.IsLocal ||
-                character.data == null ||
-                character.input == null ||
-                character.refs == null ||
-                character.refs.climbing == null)
-            {
-                return false;
-            }
-
             return
+                character != null &&
+                character.refs != null &&
+                character.refs.view != null &&
+                character.refs.view.IsMine;
+        }
+
+        private static bool IsNormalWallClimbing(Character character)
+        {
+            return
+                character != null &&
+                character.data != null &&
+                character.refs != null &&
+                character.refs.climbing != null &&
                 character.data.isClimbing &&
                 !character.data.isRopeClimbing &&
                 !character.data.isVineClimbing &&
                 character.data.currentClimbHandle == null;
         }
 
-        private static bool IsStaminaCompletelyEmpty(
-            Character character)
+        private static bool IsLocalNormalWallClimbing(Character character)
+        {
+            return
+                IsLocalCharacter(character) &&
+                IsNormalWallClimbing(character);
+        }
+
+        private static float GetRemainingStamina(Character character)
         {
             if (character == null ||
                 character.data == null)
             {
-                return false;
+                return float.MaxValue;
             }
 
             return
-                character.data.currentStamina <=
-                    StaminaZeroThreshold &&
-                character.data.extraStamina <=
-                    StaminaZeroThreshold;
+                Mathf.Max(0f, character.data.currentStamina) +
+                Mathf.Max(0f, character.data.extraStamina);
+        }
+
+        private static bool IsAtReleaseThreshold(Character character)
+        {
+            return
+                GetRemainingStamina(character) <=
+                ReleaseStaminaThreshold +
+                ComparisonEpsilon;
+        }
+
+        private static bool IsPrimaryActuallyHeld(Character character)
+        {
+            if (CharacterInput.action_usePrimary != null)
+            {
+                return
+                    CharacterInput.action_usePrimary.IsPressed();
+            }
+
+            return
+                character != null &&
+                character.input != null &&
+                character.input.usePrimaryIsPressed;
+        }
+
+        private static bool HasReleaseLock(Character character)
+        {
+            return
+                character != null &&
+                ForcedReleaseLocks.Contains(
+                    character.GetInstanceID());
+        }
+
+        private static void AddReleaseLock(Character character)
+        {
+            if (character == null)
+            {
+                return;
+            }
+
+            ForcedReleaseLocks.Add(
+                character.GetInstanceID());
+        }
+
+        private static void RemoveReleaseLock(Character character)
+        {
+            if (character == null)
+            {
+                return;
+            }
+
+            ForcedReleaseLocks.Remove(
+                character.GetInstanceID());
+        }
+
+        private static bool KeepOrClearReleaseLock(Character character)
+        {
+            if (!HasReleaseLock(character))
+            {
+                return false;
+            }
+
+            bool staminaRecovered =
+                !IsAtReleaseThreshold(character);
+
+            bool primaryReleased =
+                !IsPrimaryActuallyHeld(character);
+
+            if (staminaRecovered &&
+                primaryReleased)
+            {
+                RemoveReleaseLock(character);
+                return false;
+            }
+
+            if (character.data != null)
+            {
+                character.data.sincePressClimb =
+                    10f;
+            }
+
+            return true;
         }
 
         private static void StopClimbingImmediately(
@@ -79,24 +172,36 @@ namespace Sapphire009.RealControlMod
             Character character)
         {
             if (climbing == null ||
-                character == null)
+                character == null ||
+                character.data == null)
             {
                 return;
             }
 
-            /*
-             * 원본 미끄러짐 값을 제거한 뒤
-             * 로컬 캐릭터의 등반을 즉시 종료합니다.
-             */
+            AddReleaseLock(character);
+
+            if (character.input != null)
+            {
+                character.input.jumpWasPressed =
+                    false;
+            }
+
+            character.data.sincePressClimb =
+                10f;
+
             climbing.playerSlide =
                 Vector2.zero;
 
-            climbing.StopClimbingRpc(
-                0f);
+            /*
+             * 로컬은 RPC 왕복을 기다리지 않고 즉시 해제합니다.
+             */
+            if (character.data.isClimbing)
+            {
+                climbing.StopClimbingRpc(0f);
+            }
 
             /*
-             * 로컬에서는 이미 즉시 종료했으므로
-             * 다른 플레이어에게만 같은 결과를 전달합니다.
+             * 다른 플레이어 화면에만 종료 상태를 전송합니다.
              */
             if (PhotonNetwork.InRoom &&
                 character.refs != null &&
@@ -117,32 +222,33 @@ namespace Sapphire009.RealControlMod
             "Update")]
         private static class CharacterClimbingUpdatePatch
         {
-            /*
-             * 원본 Update가 스페이스 입력으로 등반을 종료하지 못하게 합니다.
-             *
-             * 이미 스테미나가 0이라면 원본 미끄러짐 처리가 실행되기 전에
-             * 즉시 손을 놓고 원본 Update 전체를 건너뜁니다.
-             */
             [HarmonyPrefix]
             [HarmonyPriority(Priority.First)]
             private static bool Prefix(
                 CharacterClimbing __instance)
             {
                 Character character =
-                    ResolveCharacter(
-                        __instance);
+                    ResolveCharacter(__instance);
 
-                if (!IsLocalNormalWallClimbing(
-                        character))
+                if (!IsLocalCharacter(character))
                 {
                     return true;
                 }
 
-                character.input.jumpWasPressed =
-                    false;
+                KeepOrClearReleaseLock(character);
 
-                if (!IsStaminaCompletelyEmpty(
-                        character))
+                if (!IsLocalNormalWallClimbing(character))
+                {
+                    return true;
+                }
+
+                if (character.input != null)
+                {
+                    character.input.jumpWasPressed =
+                        false;
+                }
+
+                if (!IsAtReleaseThreshold(character))
                 {
                     return true;
                 }
@@ -154,23 +260,16 @@ namespace Sapphire009.RealControlMod
                 return false;
             }
 
-            /*
-             * 원본 등반 스테미너 차감으로 이 프레임에 스테미나가 0이 되면
-             * 다음 미끄러짐이 시작되기 전에 즉시 손을 놓습니다.
-             */
             [HarmonyPostfix]
             [HarmonyPriority(Priority.Last)]
             private static void Postfix(
                 CharacterClimbing __instance)
             {
                 Character character =
-                    ResolveCharacter(
-                        __instance);
+                    ResolveCharacter(__instance);
 
-                if (!IsLocalNormalWallClimbing(
-                        character) ||
-                    !IsStaminaCompletelyEmpty(
-                        character))
+                if (!IsLocalNormalWallClimbing(character) ||
+                    !IsAtReleaseThreshold(character))
                 {
                     return;
                 }
@@ -178,6 +277,76 @@ namespace Sapphire009.RealControlMod
                 StopClimbingImmediately(
                     __instance,
                     character);
+            }
+        }
+
+        /*
+         * 강제 해제 직후 PEAK가 매 프레임 실행하는 자동 벽 잡기를 차단합니다.
+         */
+        [HarmonyPatch(
+            typeof(CharacterClimbing),
+            "TryToStartWallClimb")]
+        private static class TryToStartWallClimbPatch
+        {
+            [HarmonyPrefix]
+            [HarmonyPriority(Priority.First)]
+            private static bool Prefix(
+                CharacterClimbing __instance)
+            {
+                Character character =
+                    ResolveCharacter(__instance);
+
+                if (!IsLocalCharacter(character))
+                {
+                    return true;
+                }
+
+                return
+                    !KeepOrClearReleaseLock(character);
+            }
+        }
+
+        /*
+         * 같은 프레임에 이미 전송된 벽 잡기 RPC까지 차단합니다.
+         */
+        [HarmonyPatch(
+            typeof(CharacterClimbing),
+            "StartClimbRpc",
+            new Type[]
+            {
+                typeof(Vector3),
+                typeof(Vector3)
+            })]
+        private static class StartClimbRpcPatch
+        {
+            [HarmonyPrefix]
+            [HarmonyPriority(Priority.First)]
+            private static bool Prefix(
+                CharacterClimbing __instance)
+            {
+                Character character =
+                    ResolveCharacter(__instance);
+
+                if (!IsLocalCharacter(character))
+                {
+                    return true;
+                }
+
+                return
+                    !KeepOrClearReleaseLock(character);
+            }
+        }
+
+        [HarmonyPatch(
+            typeof(Character),
+            "OnDestroy")]
+        private static class CharacterOnDestroyPatch
+        {
+            [HarmonyPostfix]
+            private static void Postfix(
+                Character __instance)
+            {
+                RemoveReleaseLock(__instance);
             }
         }
     }
